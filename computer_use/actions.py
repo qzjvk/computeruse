@@ -21,7 +21,7 @@ def _pg():
 
     if not _CONFIGURED:
         _m.FAILSAFE = True  # slam the mouse into the top-left corner to abort
-        _m.PAUSE = 0.05
+        _m.PAUSE = 0.01  # per-call settle; the task's own waits handle loads
         _CONFIGURED = True
     pyautogui = _m
     return _m
@@ -51,7 +51,7 @@ def move(x: float, y: float, dry_run: bool = False) -> None:
     _pg().moveTo(x, y)
 
 
-def type_text(text: str, interval: float = 0.02, dry_run: bool = False) -> None:
+def type_text(text: str, interval: float = 0.005, dry_run: bool = False) -> None:
     """Type ASCII text. Non-ASCII characters are typed as empty placeholders;
     for unicode input use `key` combos or a helper like `xdotool type`."""
     _log(f"type {text!r}", dry_run)

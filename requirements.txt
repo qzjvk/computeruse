@@ -11,6 +11,9 @@ torch==2.5.1
 torchvision==0.20.1
 transformers==4.57.1
 peft>=0.13
+# 4-bit (NF4) weight-only quantization of the LLM on the resident worker.
+# Works on Pascal (sm_61); see the worker's --quant flag.
+bitsandbytes==0.44.1
 # required by the model's remote code (checked by transformers' import check)
 decord==0.6.0
 lmdb==1.7.5

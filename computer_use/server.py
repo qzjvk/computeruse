@@ -60,6 +60,7 @@ def build_worker(args):
         attn=args.attn,
         in_token_limit=limit,
         vit_cpu=vit_cpu,
+        quant=args.quant,
         verbose=not args.quiet,
     )
     # Fit the vision budget to the VRAM that is actually free after load.

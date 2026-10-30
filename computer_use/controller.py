@@ -73,6 +73,25 @@ _FULL_EDGE = frozenset({
     "footer", "status bar", "sidebar", "side bar",
 })
 
+# Edge containers whose position is fixed by the desktop (XFCE defaults:
+# the launcher panel/taskbar on the bottom edge, the menu bar on top).
+# For these the strip crop can be built without the model's box pass —
+# one fewer model pass per step. If the deterministic strip fails, the
+# normal two-pass zoom still runs (the box pass then verifies the edge).
+_EDGE_DEFAULT = {
+    "panel": "bottom", "panels": "bottom", "taskbar": "bottom",
+    "task bar": "bottom", "footer": "bottom", "status bar": "bottom",
+    "tray": "bottom",
+    "menu bar": "top",
+}
+
+# Height of the deterministic edge strip (px). A taskbar/menu bar is ~30-60 px
+# tall, so 64 px captures the whole bar with a small margin while excluding
+# the windows/wallpaper just above (or below) the edge. Fewer pixels -> fewer
+# vision patches -> a quadratically cheaper prefill (measured on the 1070:
+# 120 px -> 1096 patches -> 5.7 s prefill; 64 px -> 548 patches -> 2.9 s).
+_EDGE_STRIP_H = 64
+
 
 def _container_of(phrase: str) -> Optional[str]:
     """Return the container noun if the phrase is '<thing> in the <container>'."""
@@ -132,7 +151,7 @@ class Agent:
         self,
         worker: LocateAnythingWorker,
         dry_run: bool = False,
-        delay: float = 0.8,
+        delay: float = 0.5,
         max_steps: int = 32,
         scope: str = "window",  # "window" (active window) or "screen" (full monitor)
         monitor: Optional[int] = None,
@@ -227,7 +246,8 @@ class Agent:
         if self.save_dir:
             stamp = time.strftime("%Y%m%d-%H%M%S")
             png = self.save_dir / f"step{step:02d}-{stamp}.png"
-            cap.image.save(png)
+            # compress_level=1: lossless, ~3x faster encode on a 1080p grab.
+            cap.image.save(png, compress_level=1)
             print(f"    screenshot : {png}")
         return ax, ay
 
@@ -373,7 +393,23 @@ class Agent:
         box a 120 px corner for a full-window container in one run and the
         window itself in the next), so the whole zoom is retried once when
         it fails.
+
+        Edge containers with a fixed desktop position (_EDGE_DEFAULT) skip
+        the box pass entirely: the strip is the known edge of the screen,
+        and only pass 2 (the target in the strip) costs a model pass.
         """
+        if container in _EDGE_DEFAULT:
+            w, h = img.width, img.height
+            edge = _EDGE_DEFAULT[container]
+            box = ((0.0, float(h) - _EDGE_STRIP_H, float(w), float(h))
+                   if edge == "bottom" else (0.0, 0.0, float(w), _EDGE_STRIP_H))
+            zt = self._zoom_attempt(
+                img, phrase, container, box=box,
+                box_note=f"known {edge} edge", det_edge=edge)
+            if zt is not None:
+                return zt
+            print("    zoom: deterministic strip failed; falling back "
+                  "to the box pass")
         for attempt in (1, 2):
             zt = self._zoom_attempt(img, phrase, container)
             if zt is not None:
@@ -383,8 +419,15 @@ class Agent:
                       "(decode varies between attempts)")
         return None
 
-    def _zoom_attempt(self, img, phrase: str, container: str) -> Optional[tuple[float, float]]:
-        """One full pass-1 + pass-2 attempt. Returns capture pixels or None."""
+    def _zoom_attempt(self, img, phrase: str, container: str,
+                      box=None, box_note: Optional[str] = None,
+                      det_edge: Optional[str] = None) -> Optional[tuple[float, float]]:
+        """One pass-1 (+ pass-2) attempt. Returns capture pixels or None.
+
+        ``box``: a pre-supplied container box (the deterministic edge
+        strip) — pass 1 is skipped and the box flows through the snap/
+        crop logic unchanged.
+        """
         import math
         from PIL import Image  # local import
 
@@ -420,75 +463,91 @@ class Agent:
                 return False
             return True
 
-        box = self._ground_boxes(img, f"the {container}")
-        whole_frame = (box is not None and
-                       (box[2] - box[0]) * (box[3] - box[1]) > 0.9 * w * h)
-        if whole_frame:
-            # The container fills the capture (e.g. the active window is the
-            # browser and the phrase is "… in the browser"): a whole-frame
-            # box is the correct answer, not garbage — the crop is the whole
-            # capture and pass 2 grounds the target in it (one less retry).
-            box = (0.0, 0.0, float(w), float(h))
-        elif not _usable(box):
-            print(f"    zoom: box for 'the {container}' unusable ({box}); "
-                  "retrying box prompt")
+        if box is None:
             box = self._ground_boxes(img, f"the {container}")
-            if not _usable(box):
-                box = _point_box()
-                if box is None:
-                    print(f"    zoom: no usable box/point for 'the {container}'")
-                    return None
+            whole_frame = (box is not None and
+                           (box[2] - box[0]) * (box[3] - box[1])
+                           > 0.9 * w * h)
+            if whole_frame:
+                # The container fills the capture (e.g. the active window
+                # is the browser and the phrase is "… in the browser"): a
+                # whole-frame box is the correct answer, not garbage — the
+                # crop is the whole capture and pass 2 grounds the target
+                # in it (one less retry).
+                box = (0.0, 0.0, float(w), float(h))
+                box_note = "whole-frame box"
+            elif not _usable(box):
+                print(f"    zoom: box for 'the {container}' unusable ({box}); "
+                      "retrying box prompt")
+                box = self._ground_boxes(img, f"the {container}")
+                if not _usable(box):
+                    box = _point_box()
+                    if box is None:
+                        print(f"    zoom: no usable box/point for 'the {container}'")
+                        return None
+        box_note = box_note or "box"
         x1, y1, x2, y2 = box
-        # Models box containers loosely (the box spills into the surrounding
-        # area). Panels/bars hug a screen edge, so snap a box that touches
-        # an edge to a thin strip along that edge: the crop gets smaller and
-        # the target bigger in pass 2.
-        # Only thin boxes (real strips: panels, bars) are snapped: a big
-        # window that merely touches a screen edge must keep its full box,
-        # so the thinness test is 25% of the capture dimension. For known
-        # edge containers (panel, taskbar, ...) the model sometimes boxes a
-        # whole screen quadrant; the edge touch is then the reliable signal,
-        # so the threshold relaxes to 60%.
-        edge = container in _EDGE_CONTAINERS
-
-        def _thin(span: float, size: float) -> bool:
-            return span < size * (0.6 if edge else 0.25)
-
-        snap_x = snap_y = 0  # -1: snapped to bottom/right edge, 1: top/left
-        if y2 >= h - 4 and _thin(y2 - y1, h):
-            y1, snap_y = h - 120, -1
-        elif y1 <= 4 and _thin(y2 - y1, h):
-            y2, snap_y = 120, 1
-        if x2 >= w - 4 and _thin(x2 - x1, w):
-            x1, snap_x = w - 120, -1
-        elif x1 <= 4 and _thin(x2 - x1, w):
-            x2, snap_x = 120, 1
-        # A box that needed no snapping is the model's own tight box
-        # (e.g. a browser window): a point inside it is inside the
-        # container, so it is trusted even on flat surfaces (an address
-        # bar is plain white). Snapped strips keep the content gate,
-        # because a loose box spills onto the wallpaper.
-        trust_box = (snap_x == 0 and snap_y == 0)
-
-        # Expand in FULL-capture coordinates: a container (e.g. a panel) can
-        # straddle tile boundaries, so the crop must come from the capture,
-        # not from whatever view produced the box. A snapped edge already
-        # hugs the screen, so only a small margin is needed on its inside.
-        m, m_edge = 160, 40
-        # A full-edge container (panel, taskbar, menu bar) spans the whole
-        # edge: when it snaps to a horizontal edge the strip runs the full
-        # screen width, and to a vertical edge the full screen height. The
-        # box's extent along the edge is the model's guess, not a boundary.
-        if container in _FULL_EDGE and snap_y and not snap_x:
-            cx1, cx2 = 0, int(w)
+        if det_edge is not None:
+            # A deterministic edge strip: the supplied box is already the
+            # exact crop (it hugs a known screen edge, so no snap, no margin,
+            # no upscale). Keep the content gate (trust_box False) because
+            # the strip still includes wallpaper beside the panel.
+            cx1, cy1, cx2, cy2 = int(x1), int(y1), int(x2), int(y2)
+            trust_box = False
         else:
-            cx1 = max(0, int(x1) - (m_edge if snap_x == -1 else m))
-            cx2 = min(w, int(x2) + (m_edge if snap_x == 1 else m))
-        if container in _FULL_EDGE and snap_x and not snap_y:
-            cy1, cy2 = 0, int(h)
-        else:
-            cy1 = max(0, int(y1) - (m_edge if snap_y == -1 else m))
-            cy2 = min(h, int(y2) + (m_edge if snap_y == 1 else m))
+            # Models box containers loosely (the box spills into the
+            # surrounding area). Panels/bars hug a screen edge, so snap a box
+            # that touches an edge to a thin strip along that edge: the crop
+            # gets smaller and the target bigger in pass 2.
+            # Only thin boxes (real strips: panels, bars) are snapped: a big
+            # window that merely touches a screen edge must keep its full
+            # box, so the thinness test is 25% of the capture dimension. For
+            # known edge containers (panel, taskbar, ...) the model sometimes
+            # boxes a whole screen quadrant; the edge touch is then the
+            # reliable signal, so the threshold relaxes to 60%.
+            edge = container in _EDGE_CONTAINERS
+
+            def _thin(span: float, size: float) -> bool:
+                return span < size * (0.6 if edge else 0.25)
+
+            snap_x = snap_y = 0  # -1: snapped to bottom/right edge, 1: top/left
+            if y2 >= h - 4 and _thin(y2 - y1, h):
+                y1, snap_y = h - 120, -1
+            elif y1 <= 4 and _thin(y2 - y1, h):
+                y2, snap_y = 120, 1
+            if x2 >= w - 4 and _thin(x2 - x1, w):
+                x1, snap_x = w - 120, -1
+            elif x1 <= 4 and _thin(x2 - x1, w):
+                x2, snap_x = 120, 1
+            # A box that needed no snapping is the model's own tight box
+            # (e.g. a browser window): a point inside it is inside the
+            # container, so it is trusted even on flat surfaces (an address
+            # bar is plain white). Snapped strips keep the content gate,
+            # because a loose box spills onto the wallpaper.
+            trust_box = (snap_x == 0 and snap_y == 0)
+
+            # Expand in FULL-capture coordinates: a container (e.g. a panel)
+            # can straddle tile boundaries, so the crop must come from the
+            # capture, not from whatever view produced the box. A snapped edge
+            # already hugs the screen, so only a small margin is needed on its
+            # inside.
+            m, m_edge = 160, 40
+            # A full-edge container (panel, taskbar, menu bar) spans the whole
+            # edge: when it snaps to a horizontal edge the strip runs the full
+            # screen width, and to a vertical edge the full screen height. The
+            # box's extent along the edge is the model's guess, not a boundary.
+            if container in _FULL_EDGE and snap_y and not snap_x:
+                cx1, cx2 = 0, int(w)
+            else:
+                cx1 = max(0, int(x1) - (m_edge if snap_x == -1 else m))
+                cx2 = min(w, int(x2) + (m_edge if snap_x == 1 else m))
+            if container in _FULL_EDGE and snap_x and not snap_y:
+                cy1, cy2 = 0, int(h)
+            else:
+                m_y = m_edge if snap_y != 0 else m
+                cy1 = max(0, int(y1) - m_y)
+                cy2 = min(h, int(y2) + m_y)
+
         if cx2 - cx1 < 28 or cy2 - cy1 < 28:
             print("    zoom: container box too small after expansion")
             return None
@@ -497,22 +556,30 @@ class Agent:
         # Keep the pass-2 prefill small while giving the target as many
         # patches as possible: upscale small/thin crops (a 32 px icon in a
         # 160 px strip becomes 64 px in 320 px -> twice the patch rows),
-        # and shrink to the token budget if that overruns it.
-        budget = getattr(self.worker, "in_token_limit", None) or 2048
-        cpatches = (crop.width // 14) * (crop.height // 14)
-        factor = 1.0
-        if max(crop.size) < 400 or min(crop.size) <= 160:
-            factor = 2.0
-        if (int(crop.width * factor) // 14) * (int(crop.height * factor) // 14) > budget:
-            factor = math.sqrt(budget / cpatches)
-            while factor > 0.5 and (int(crop.width * factor) // 14) * (
-                    int(crop.height * factor) // 14) > budget:
-                factor *= 0.98
+        # and shrink to the token budget if that overruns it. A
+        # full-screen-length edge strip (and the deterministic strip) stays
+        # at 1.0x: it is already tall enough that a 32 px icon spans ~2 patch
+        # rows, and the 2x upscale doubles the CPU-ViT cost (measured
+        # 3.7 s -> 1.4 s for the bottom-panel strip on the 1070).
+        if det_edge is not None:
+            factor = 1.0
+        else:
+            full_strip = container in _FULL_EDGE and (snap_x or snap_y)
+            budget = getattr(self.worker, "in_token_limit", None) or 2048
+            cpatches = (crop.width // 14) * (crop.height // 14)
+            factor = 1.0
+            if not full_strip and (max(crop.size) < 400 or min(crop.size) <= 160):
+                factor = 2.0
+            if (int(crop.width * factor) // 14) * (int(crop.height * factor) // 14) > budget:
+                factor = math.sqrt(budget / cpatches)
+                while factor > 0.5 and (int(crop.width * factor) // 14) * (
+                        int(crop.height * factor) // 14) > budget:
+                    factor *= 0.98
         if factor != 1.0:
             resample = getattr(Image, "Resampling", Image)
             crop = crop.resize((max(14, int(crop.width * factor)),
-                                max(14, int(crop.height * factor))), resample.BILINEAR)
-        print(f"    zoom: 'the {container}' -> box ({x1:.0f},{y1:.0f})-({x2:.0f},{y2:.0f}) "
+                                 max(14, int(crop.height * factor))), resample.BILINEAR)
+        print(f"    zoom: 'the {container}' -> {box_note} ({x1:.0f},{y1:.0f})-({x2:.0f},{y2:.0f}) "
               f"-> crop ({cx1},{cy1})-({cx2},{cy2}) at {factor:.2f}x")
 
         # Pass 2. The model can land on flat content (wallpaper) even when
@@ -529,13 +596,20 @@ class Agent:
                            min(gray.width, int(x) + r), min(gray.height, int(y) + r)))
             return ImageStat.Stat(b).stddev[0]
 
-        # Background level: median of a coarse grid over the crop.
+        # Background level: a low quantile of a coarse grid over the crop.
+        # The median is right when the crop is mostly empty background, but
+        # a crop can contain large non-background regions (a window
+        # straddling the strip), and those push the median up until the
+        # real target is rejected (measured: floor 83 vs icon std 85 on
+        # the bottom strip with a terminal window open). The lower quartile
+        # stays at the empty-background level while such regions are
+        # present, and plays the median's role on uniform crops.
         bg = []
         for gx in range(1, 12):
             for gy in range(1, 7):
                 x, y = gray.width * gx / 12, gray.height * gy / 7
                 bg.append(_std_at(x, y))
-        floor = max(30.0, 1.5 * statistics.median(bg))
+        floor = max(30.0, 1.5 * sorted(bg)[len(bg) // 4])
 
         def _score(result, kind: str) -> Optional[tuple[float, float, float]]:
             why = self._degenerate(result, crop.size[0], crop.size[1], kind)

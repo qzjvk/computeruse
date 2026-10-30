@@ -26,6 +26,22 @@ xfce4-session &
 firefox-esr --no-sandbox &
 
 sleep 2
+# Pin the launcher panel in place. The image's XFCE config ships the bottom
+# launcher (panel-2) with autohide-behavior=1 ("hide on focus"): whenever an
+# app window (e.g. a terminal left open by a previous task) holds focus, the
+# panel slides off-screen and its launcher icons disappear from the capture.
+# A focus-dependent panel makes the desktop state non-deterministic for any
+# task that touches it, so pin it at container start. The panel watches its
+# own xfconf channel, so the change applies live; if the panel has not
+# started yet, it simply reads the pinned value on startup.
+for _ in $(seq 1 30); do
+    if xfconf-query -c xfce4-panel -p /panels/panel-2/autohide-behavior >/dev/null 2>&1; then
+        xfconf-query -c xfce4-panel -p /panels/panel-2/autohide-behavior -t uint -s 0 \
+            || echo "[sandbox] warning: could not pin the launcher panel"
+        break
+    fi
+    sleep 0.5
+done
 # -ncache 20: keep 20 changed sub-regions on the server side so redraws of
 # small areas (cursor, panels) don't re-transfer the whole screen.
 x11vnc -display :99 -forever -nopw -shared -noxdamage -ncache 20 &
@@ -55,7 +71,11 @@ cd /app
 # the VNC session or the browser. Code changes need no image rebuild —
 # the container mounts the host's computer_use/ live.
 while true; do
-    python -m computer_use serve --model /locatenv --scope window ${GPU1070:+--gpu "$GPU1070"} || rc=$?
+    # Note: no --quant nf4 here. Measured on the 1070: the 4-bit dequant kernel
+# does not beat fp16 (prefill is attention/compute-bound, not weight-stream
+# bound), and for small crops the 4-bit weight stream is actually slower.
+# --quant nf4 is available for VRAM headroom (7 GB -> 3.5 GB).
+python -m computer_use serve --model /locatenv --scope window ${GPU1070:+--gpu "$GPU1070"} || rc=$?
     echo "[sandbox] worker exited (code ${rc:-0}); restarting in 5 s"
     sleep 5
 done

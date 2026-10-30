@@ -43,6 +43,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Attention implementation (default: sdpa)")
     p.add_argument("--in-token-limit", type=int, default=None,
                    help="Max vision patch tokens (default auto: 1024 on legacy GPUs, 2048 elsewhere; raise on big-VRAM GPUs, e.g. 4096/25600)")
+    p.add_argument("--quant", choices=["off", "nf4"], default="off",
+               help="Weight-only quantization of the LLM (nf4 = 4-bit; "
+                    "~4x less VRAM and ~4x less weight traffic per pass)")
     p.add_argument("--vit-cpu", choices=["auto", "on", "off"], default="auto",
                    help="Run the MoonViT vision encoder on the CPU (default auto: on for sm<8 / 8 GB cards)")
     p.add_argument("--generation-mode", choices=["hybrid", "fast", "slow"], default="hybrid")
@@ -54,7 +57,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="Ground and log actions but do not move the mouse")
     p.add_argument("--scope", choices=["window", "screen"], default="window",
                    help="Capture scope: the active window (default, near-native resolution) or the full monitor")
-    p.add_argument("--delay", type=float, default=0.8, help="Pause after each action (seconds)")
+    p.add_argument("--delay", type=float, default=0.5,
+                   help="Pause after each grounded action (seconds); 0.5 lets "
+                        "a click settle AND gives a freshly spawned window "
+                        "(e.g. a launcher icon opening a terminal) time to "
+                        "appear and gain focus before the next action. A "
+                        "task's own 'wait N' covers longer loads.")
     p.add_argument("--max-steps", type=int, default=32)
     p.add_argument("--monitor", type=int, help="Monitor index for screenshots (default: mouse position)")
     p.add_argument("--save-dir", default="runs", help="Where to save step screenshots ('' to disable)")

@@ -112,8 +112,14 @@ class LocateAnythingWorker:
         attn: Optional[str] = None,
         in_token_limit: Optional[int] = None,  # None: auto (1024 on sm<75, 2048 elsewhere)
         vit_cpu: bool | str = "auto",  # "auto": True on sm < 8 (8 GB cards)
+        quant: str = "off",  # "off" | "nf4" (4-bit weight-only LLM)
         verbose: bool = True,
     ):
+        # Prime the mss/Xlib capture handles BEFORE the first CUDA call: a fresh
+        # X connection opened after CUDA init segfaults in the mss/Xlib
+        # native path (see the module docstring in screen.py).
+        from . import screen as _screen
+        _screen.prime()
         self.device = pick_device(device)
         cap = gpu_capability(self.device)
         if in_token_limit is None:
@@ -180,6 +186,10 @@ class LocateAnythingWorker:
                     child.to(self.device)
         else:
             model = model.to(self.device)
+        if quant == "nf4":
+            self._quantize_language_model_nf4(model)
+        elif quant != "off":
+            raise ValueError(f"unknown quant={quant!r} (use 'off' or 'nf4')")
         self.model = model.eval()
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
@@ -219,6 +229,66 @@ class LocateAnythingWorker:
                 f"dtype={dtype} attn={self.attn} in_token_limit={in_token_limit} "
                 f"free_vram={free_gb / 1e9:.2f}G"
             )
+
+    # ------------------------------------------------------------------ quant
+
+    def _quantize_language_model_nf4(self, model):
+        """4-bit (NF4) weight-only quantization of the LLM (bitsandbytes).
+
+        Prefill on this card is weight-stream bound: every forward reads
+        the whole LLM once, and fp16 that is ~6.3 GB -> most of the ~35 s
+        pass wall on the 1070. NF4 cuts the stream to ~1.5 GB.
+
+        lm_head stays fp16: it is tied to the embedding table (tied
+        weights), and the logit projection runs only once per decoded
+        token (single-object answers are ~8 tokens). The vision model
+        stays fp32 on the CPU; mlp1 is tiny.
+        """
+        import bitsandbytes as bnb
+        import torch.nn as nn
+
+        n = 0
+        for name, module in list(model.named_modules()):
+            if (not isinstance(module, nn.Linear)
+                    or not name.startswith("language_model")
+                    or name.endswith("lm_head")):
+                continue
+            w = module.weight
+            # bitsandbytes < 0.45: construct the module with the shapes,
+            # load the fp16 weights in, then .to(device) — that is what
+            # triggers the in-place NF4 quantization of the Params4bit
+            # weight.
+            l4 = bnb.nn.Linear4bit(
+                input_features=w.shape[1],
+                output_features=w.shape[0],
+                bias=module.bias is not None,
+                quant_type="nf4",
+                compress_statistics=True,
+                device=self.device,
+            )
+            sd = {"weight": w.detach()}
+            if module.bias is not None:
+                sd["bias"] = module.bias.detach()
+            l4.load_state_dict(sd)
+            parent = model
+            for part in name.split(".")[:-1]:
+                parent = getattr(parent, part)
+            setattr(parent, name.split(".")[-1], l4)
+            # Release the fp16 weights layer by layer: 6.3 GB (fp16) +
+            # 1.5 GB (NF4) cannot coexist on an 8 GB card mid-loop.
+            module._parameters["weight"] = None
+            if "bias" in module._parameters:
+                module._parameters["bias"] = None
+            del w, sd
+            l4 = l4.to(self.device)
+            n += 1
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
+        if self.verbose:
+            free_gb, _ = torch.cuda.mem_get_info(self.device.index)
+            print(f"[worker] NF4: quantized {n} LLM linears "
+                  f"(~4.4x less weight traffic per pass); "
+                  f"free_vram={free_gb / 1e9:.2f}G", flush=True)
 
     # ------------------------------------------------------------------ core
 

@@ -182,7 +182,7 @@ python -m computer_use --image screenshot.png --query "the gear"
 ```
 
 Model-level options (`--model/--gpu/--dtype/--attn/--in-token-limit/--scope/
---vit-cpu`) are fixed by the `serve` invocation; per-run options (`--dry-run`,
+--vit-cpu/--quant`) are fixed by the `serve` invocation; per-run options (`--dry-run`,
 `--delay`, `--max-steps`, `--monitor`, `--save-dir`, `--no-box-fallback`) are
 sent with each task. `--no-server` forces a local load. Measured on the 1070:
 ~90 s per run without the worker vs ~35–45 s with it (2 tiled passes at
