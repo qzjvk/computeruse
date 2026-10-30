@@ -4,7 +4,9 @@
 #   ./sandbox.sh status    # or: docker compose ps  (shows "healthy" when
 #   ./sandbox.sh down      # the model has finished loading)
 #
-# Desktop view: http://localhost:6090/vnc.html
+# Desktop views:
+#   browser  http://localhost:6090/vnc.html   (noVNC)
+#   native   VNC :5900  (any VNC client; crisp 1:1, less lag)
 #
 # GPU notes for this host (runc 1.1.x, cgroup v2, driver 580):
 #   * BOTH the nvidia reservation (deploy.resources) and the explicit
@@ -23,7 +25,8 @@ services:
     init: true
     shm_size: 4gb
     ports:
-      - "6090:6090"
+      - "6090:6090"   # noVNC (browser)
+      - "5900:5900"   # raw VNC (native clients: crisp 1:1, no web lag)
     volumes:
       - ./locatenv:/locatenv:ro
       - ./runs:/app/runs

@@ -19,8 +19,10 @@ import contextlib
 import io
 import json
 import os
+import re
 import socket
 import socketserver
+import time
 
 SOCKET_PATH = os.environ.get("CUA_SOCKET", "/tmp/computeruse.sock")
 
@@ -60,13 +62,41 @@ def build_worker(args):
         vit_cpu=vit_cpu,
         verbose=not args.quiet,
     )
+    # Fit the vision budget to the VRAM that is actually free after load.
+    # The limit only bounds the prefill (read at ground time), and the
+    # prefill's transient logits copy is ~160 MiB per 1024 vision tokens
+    # (measured on the 1070). Raising it buys near-native resolution;
+    # stepping it down keeps the agent running (instead of OOMing) while
+    # another process shares the card.
+    if worker.device.type == "cuda" and worker.device.index is not None:
+        free, _ = torch.cuda.mem_get_info(worker.device.index)
+        need = lambda tok: int(tok / 1024 * 160) * 1024 * 1024
+        margin = 300 * 1024 * 1024  # allocator slack + sharing pressure
+
+        limit = worker.in_token_limit
+        if scope == "screen":
+            # Screen scope: raise as far as the free VRAM allows.
+            while limit < 4096 and free >= need(limit + 1024) + margin:
+                limit += 1024
+        while limit > 1024 and free < need(limit) + margin:
+            limit -= 1024
+        if limit != worker.in_token_limit:
+            worker.in_token_limit = limit
+            try:
+                worker.processor.image_processor.in_token_limit = limit
+            except AttributeError:
+                pass
+            print(f"[serve] in_token_limit={limit} "
+                  f"({free / 1e9:.2f}G free after load, scope={scope})", flush=True)
     return worker, scope
 
 
 class _Handler(socketserver.StreamRequestHandler):
     def handle(self):
         buf = io.StringIO()
+        req: dict = {}
         resp: dict
+        t0 = time.time()
         try:
             req = json.loads(self.rfile.readline().decode() or "{}")
             if "task" not in req and "kind" not in req:
@@ -88,7 +118,10 @@ class _Handler(socketserver.StreamRequestHandler):
                         dry_run=bool(req.get("dry_run", False)),
                         delay=float(req.get("delay", 0.8)),
                         max_steps=int(req.get("max_steps", 32)),
-                        scope=self.server.scope,
+                        # Per-run scope override; the serve invocation sets
+                        # the default. (The token budget is fixed by the
+                        # worker, but both scopes share one budget here.)
+                        scope=req.get("scope") or self.server.scope,
                         monitor=req.get("monitor"),
                         save_dir=req.get("save_dir") or None,
                         box_fallback=bool(req.get("box_fallback", True)),
@@ -97,6 +130,22 @@ class _Handler(socketserver.StreamRequestHandler):
             resp = {"ok": ok, "log": buf.getvalue()}
         except Exception as e:  # report back, keep the server alive
             resp = {"ok": False, "error": repr(e), "log": buf.getvalue()}
+        # Task history on the serve process's stdout, so
+        # `docker logs cuasandbox` doubles as a task audit log.
+        try:
+            if "task" in req:
+                label = f"task={req['task']!r}"
+            elif "kind" in req:
+                label = f"offline query={req.get('query', '')!r}"
+            else:
+                label = "stray connection"
+            m = re.search(r"target\s*:\s*(.+)", resp.get("log", ""))
+            target = m.group(1).strip() if m else "-"
+            print(f"[serve] {time.strftime('%Y-%m-%d %H:%M:%S')} {label} "
+                  f"ok={resp.get('ok')} elapsed={time.time() - t0:.1f}s target={target}",
+                  flush=True)
+        except Exception:
+            pass
         self.wfile.write(json.dumps(resp).encode() + b"\n")
 
 

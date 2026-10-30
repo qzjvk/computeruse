@@ -254,28 +254,60 @@ class LocateAnythingWorker:
         image = image.convert("RGB")
         verbose = self.verbose if verbose is None else verbose
 
-        inputs = self._prepare_inputs(image, question)
-        pixel_values = inputs["pixel_values"].to(self.device, self.dtype)
-        input_ids = inputs["input_ids"].to(self.device)
-        attention_mask = inputs["attention_mask"].to(self.device)
-        image_grid_hws = inputs.get("image_grid_hws", None)
+        def _run():
+            # Inputs are prepared under the processor's current limit: on an
+            # OOM retry the limit is halved first, so the image is actually
+            # re-shrunk, not just re-generated.
+            inputs = self._prepare_inputs(image, question)
+            pixel_values = inputs["pixel_values"].to(self.device, self.dtype)
+            input_ids = inputs["input_ids"].to(self.device)
+            attention_mask = inputs["attention_mask"].to(self.device)
+            image_grid_hws = inputs.get("image_grid_hws", None)
+            return self.model.generate(
+                pixel_values=pixel_values,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                image_grid_hws=image_grid_hws,
+                tokenizer=self.tokenizer,
+                max_new_tokens=max_new_tokens,
+                use_cache=True,
+                generation_mode=generation_mode,
+                temperature=temperature,
+                do_sample=temperature > 0,
+                top_p=0.9 if temperature > 0 else None,
+                repetition_penalty=1.1,
+                verbose=verbose,
+            )
 
         t0 = time.time()
-        response = self.model.generate(
-            pixel_values=pixel_values,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            image_grid_hws=image_grid_hws,
-            tokenizer=self.tokenizer,
-            max_new_tokens=max_new_tokens,
-            use_cache=True,
-            generation_mode=generation_mode,
-            temperature=temperature,
-            do_sample=temperature > 0,
-            top_p=0.9 if temperature > 0 else None,
-            repetition_penalty=1.1,
-            verbose=verbose,
-        )
+        try:
+            response = _run()
+        except RuntimeError as e:
+            if "out of memory" not in str(e).lower():
+                raise
+            # The budget assumed at load time no longer fits (the card may be
+            # shared or fragmented). Retry once at half the vision budget.
+            torch.cuda.empty_cache()
+            limit = self.in_token_limit or 2048
+            half = max(1024, limit // 2)
+            if half >= limit:
+                raise
+            old = self.in_token_limit
+            self.in_token_limit = half
+            try:
+                self.processor.image_processor.in_token_limit = half
+            except AttributeError:
+                pass
+            print(f"[worker] prefill OOM at in_token_limit={limit}; "
+                  f"retrying at {half} (card shared or fragmented)", flush=True)
+            try:
+                response = _run()
+            finally:
+                self.in_token_limit = old
+                try:
+                    self.processor.image_processor.in_token_limit = old
+                except AttributeError:
+                    pass
         # Reclaim the prefill's transient memory before the next query.
         if self.device.type == "cuda":
             torch.cuda.empty_cache()

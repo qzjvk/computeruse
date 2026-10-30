@@ -129,7 +129,34 @@ def _monitor_overlapping(rect: dict, monitors: list[dict]) -> dict:
 
 
 def active_window_rect() -> Optional[dict]:
-    """Geometry of the active window via xdotool, or None if unavailable."""
+    """Geometry of the active window, or None if unavailable.
+
+    The position comes from XTranslateCoordinates (via the Xlib display
+    opened by prime()) rather than ``xdotool getwindowgeometry``: for
+    windows reparented by a WM (every decorated window under xfwm),
+    xdotool reports the client rect offset by the frame border, which
+    shifted captures ~30 px and cropped the top of the window (tab bars,
+    toolbars) out of the image.
+    """
+    try:
+        wid = int(subprocess.check_output(
+            ["xdotool", "getactivewindow"], text=True, timeout=3
+        ).strip())
+    except Exception:
+        return None
+
+    if _XDISPLAY is not None:
+        try:
+            root = _XDISPLAY.screen().root
+            win = _XDISPLAY.create_resource_object("window", wid)
+            reply = root.translate_coords(wid, 0, 0)
+            x, y = reply.x, reply.y
+            g = win.get_geometry()
+            return {"left": x, "top": y, "width": g.width, "height": g.height}
+        except Exception:
+            pass
+
+    # Fallback: xdotool's shell output (less reliable for reparented windows).
     try:
         out = subprocess.check_output(
             ["xdotool", "getactivewindow", "getwindowgeometry", "--shell"],

@@ -29,16 +29,19 @@ case "$cmd" in
         # The sandbox owns the model now; drop any host-side resident
         # worker so both are not fighting over the same VRAM.
         pkill -f "computer_use serve" 2>/dev/null || true
-        if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" = "true" ]; then
-            echo "Sandbox is already running."
-        else
-            # Remove stale/non-compose containers with the same name.
+        # Drop a pre-compose (docker run) container with the same name; it
+        # would block compose. Compose-managed containers pass this check.
+        if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" = "true" ] \
+           && [ -z "$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$NAME" 2>/dev/null)" ]; then
             docker rm -f "$NAME" 2>/dev/null || true
-            "${COMPOSE[@]}" up -d --build
-            echo "Sandbox is up (model loads for ~40 s; 'status' shows healthy when ready)."
         fi
-        echo "  Desktop:  http://localhost:6090/vnc.html"
-        echo "  Task:     $0 task \"click the address bar; done\""
+        # Idempotent: no-op while running with the same config, recreates
+        # when the compose file changed, builds when the image is stale.
+        "${COMPOSE[@]}" up -d --build
+        echo "Sandbox is up (model loads for ~40 s; 'status' shows healthy when ready)."
+        echo "  Desktop (browser): http://localhost:6090/vnc.html"
+        echo "  Desktop (native):  VNC :5900 (crisp 1:1, any VNC client)"
+        echo "  Task:              $0 task \"click the address bar; done\""
         ;;
     task)
         exec docker exec "$NAME" python -m computer_use "$@"

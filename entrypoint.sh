@@ -26,11 +26,27 @@ xfce4-session &
 firefox-esr --no-sandbox &
 
 sleep 2
-x11vnc -display :99 -forever -nopw -shared -noxdamage &
+# -ncache 20: keep 20 changed sub-regions on the server side so redraws of
+# small areas (cursor, panels) don't re-transfer the whole screen.
+x11vnc -display :99 -forever -nopw -shared -noxdamage -ncache 20 &
 websockify --web=/usr/share/novnc 6090 localhost:5900 &
 
-echo "[sandbox] XFCE up on :99, desktop at http://localhost:6090/vnc.html"
+echo "[sandbox] XFCE up on :99"
+echo "[sandbox]   browser view: http://localhost:6090/vnc.html"
+echo "[sandbox]   native VNC:   :5900 (any VNC client, e.g. vinagre/TigerVNC)"
 echo "[sandbox] starting agent worker (model load ~30 s)..."
 
+# The sandbox runs on the GTX 1070. Find it by name in CUDA's own device
+# enumeration: nvidia-smi indices do NOT match torch/cuda indices on this
+# host (different ordering), and the index can change across boots anyway.
+# Fall back to auto-pick (most free VRAM) if the card is not present.
+GPU1070=$(python3 -c "
+import torch
+for i in range(torch.cuda.device_count()):
+    if '1070' in torch.cuda.get_device_properties(i).name:
+        print(i)
+        break
+" 2>/dev/null || true)
+
 cd /app
-exec python -m computer_use serve --model /locatenv --scope window
+exec python -m computer_use serve --model /locatenv --scope window ${GPU1070:+--gpu "$GPU1070"}

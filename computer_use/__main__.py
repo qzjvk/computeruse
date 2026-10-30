@@ -119,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_server:
         resp = server.send_task({
             "kind": "task", "task": task,
+            "scope": args.scope,
             "dry_run": args.dry_run, "delay": args.delay,
             "max_steps": args.max_steps, "monitor": args.monitor,
             "save_dir": args.save_dir or None,

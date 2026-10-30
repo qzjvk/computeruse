@@ -34,16 +34,28 @@ def parse_points(answer: str, image_width: int, image_height: int) -> list[tuple
 
 
 def parse_boxes(answer: str, image_width: int, image_height: int) -> list[tuple[float, float, float, float]]:
-    """Extract 4-coordinate boxes as (x1, y1, x2, y2) pixel rects."""
+    """Extract 4-coordinate boxes as (x1, y1, x2, y2) pixel rects.
+
+    The model's coordinate order varies by decode path ((x1,x2,y1,y2) or
+    (x1,y1,x2,y2)), so both are tried and the larger-area interpretation is
+    kept: the cross-interpretation scrambles a real box into a smaller (or
+    degenerate) one.
+    """
     boxes: list[tuple[float, float, float, float]] = []
     for m in _BOX_RE.finditer(answer):
         g = m.groups()
         if g[3] is None:  # not a 4-coord box
             continue
         c1, c2, c3, c4 = (int(v) for v in g)
-        # Resolve ordering ambiguity: first two are X, last two are Y.
-        xa, xb = min(c1, c2), max(c1, c2)
-        ya, yb = min(c3, c4), max(c3, c4)
+        # A: first two are X, last two are Y.  B: (x1, y1, x2, y2).
+        axa, axb = min(c1, c2), max(c1, c2)
+        aya, ayb = min(c3, c4), max(c3, c4)
+        bxa, bxb = min(c1, c3), max(c1, c3)
+        bya, byb = min(c2, c4), max(c2, c4)
+        if (bxb - bxa) * (byb - bya) > (axb - axa) * (ayb - aya):
+            xa, xb, ya, yb = bxa, bxb, bya, byb
+        else:
+            xa, xb, ya, yb = axa, axb, aya, ayb
         boxes.append((_scale(xa, image_width), _scale(ya, image_height),
                       _scale(xb, image_width), _scale(yb, image_height)))
     return boxes

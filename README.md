@@ -34,12 +34,37 @@ see, so the agent manages its capture:
   (via `xdotool`) instead of the full monitor, so the same token budget buys
   near-native resolution of the UI being operated on.
 * **`--scope screen`** — full monitor (the one under the mouse).
-* **Auto-tiling** — if the capture has more vision patches than the token
-  budget (e.g. a maximized 1920-wide browser at `in_token_limit=4096`), the
-  capture is split into 2-4 tiles and each tile is grounded at native
-  resolution; the point deepest inside its tile wins. This costs one model
-  pass per tile (~15 s on the 1070) but is what makes large windows
-  clickable.
+* **Capture strategy** — the capture is compared to the token budget and
+  one of three passes is used:
+  1. *fits* → one pass at native resolution.
+  2. *slight overrun* (≤ 1.5× budget) → the **whole** capture is shrunk to
+     fit and grounded in a single pass. Full context stays in view (tab
+     bars, sidebars), which is what a 3B model needs to pick the right
+     small element, and it is also faster than tiling (one pass, not four).
+  3. *large overrun* (e.g. a full 1920-wide desktop) → split into 2-4
+     tiles, each grounded at native resolution; the point deepest inside
+     its tile wins. This costs one model pass per tile (~15 s on the 1070)
+     but is what makes large captures clickable.
+* **Two-stage zoom for "… in the …" phrasings** — "click the terminal
+  icon in the panel" is exactly where the passes above fail (a 32 px
+  icon inside a 1920×1080 capture). So when the phrase names a known
+  container (panel, tab bar, toolbar, address bar, title bar, …), the
+  agent first *boxes the container* (large and easy, one pass over the
+  whole capture), then re-grounds the original phrase in a margin-expanded
+  crop of it — upscaled when small. Edge-hugging containers (panels,
+  bars) are snapped to a thin strip along the screen edge so the crop
+  stays small. If the container can't be boxed (point prompt fallback
+  first, then the normal path), zoom is skipped and the normal strategy
+  runs. Measured: "terminal icon in the panel" 45 s, "plus button in the
+  tab bar" 55 s, both within a few px of the real target.
+* **VRAM adapts at load and at run time** — after the model loads, the
+  vision-token budget is fit to the free VRAM (prefill needs ~160 MiB per
+  1024 vision tokens; the budget steps down/up so a shared card never
+  OOMs). If a prefill OOMs anyway (another process grew, fragmentation),
+  the worker retries once at half the budget and continues.
+* **Degenerate answers are rejected** — box spam (dozens of boxes),
+  repeated identical boxes, or full-frame boxes are treated as "not found"
+  and the step fails cleanly instead of clicking a random spot.
 
 Measured on the 1070 (dry-run): a 1010×900 browser window grounded both of
 two page buttons within ~5 px; a 1005×829 window tiled 2×2 hit the X.com
@@ -142,18 +167,28 @@ sent with each task. `--no-server` forces a local load. Measured on the 1070:
 If you want the agent to run while you are still using the machine, give it
 its own XFCE desktop in Docker. It is managed with docker compose
 (`docker-compose.yml` + the `./sandbox.sh` wrapper): Xvfb + XFCE at
-1920×1080, a noVNC view, and a resident `serve` worker that picks the GPU
-with the most free VRAM. The container restarts automatically
-(`unless-stopped`) and shows as `healthy` once the model is loaded:
+1920×1080, a noVNC browser view **plus a raw VNC port (5900) for native
+clients**, and a resident `serve` worker **pinned to the GTX 1070**. The
+card is found by name in CUDA's own device enumeration — nvidia-smi
+indices do not match torch/cuda indices on this host, and the index can
+change across boots; without the card the worker falls back to auto-pick
+(most free VRAM). The container restarts automatically (`unless-stopped`)
+and shows as `healthy` once the model is loaded:
 
 ```bash
 ./sandbox.sh up                        # build (cached) + start
-# desktop view in your browser:  http://localhost:6090/vnc.html
+# desktop view, two ways:
+#   browser:  http://localhost:6090/vnc.html   (noVNC)
+#   native:   VNC :5900  (any VNC client; crisp 1:1, less lag)
 ./sandbox.sh dry "click the firefox icon"   # grounding only, no clicks
 ./sandbox.sh task "click the terminal icon in the panel; done"
 ./sandbox.sh status                    # state + recent logs (healthy = ready)
 ./sandbox.sh down
 ```
+
+Every task the agent runs is logged on the serve process's stdout, so
+`docker logs cuasandbox` doubles as a task audit log (task text, ok/fail,
+elapsed time, and the grounded target for each step).
 
 `./sandbox.sh up` is just `docker compose up -d --build` (plus killing a
 host-side `serve` if one is running); plain compose works too:
@@ -180,8 +215,9 @@ Notes:
   matches the kernel module.
 - `locatenv/` is bind-mounted read-only into the container, so no copy of
   the weights is needed.
-- Port 6090 is used because 6080 is already taken on this host; change both
-  `entrypoint.sh` and `sandbox.sh` if you move it.
+- Ports 6090 (noVNC) and 5900 (raw VNC) are used because 6080 is already
+  taken on this host; change `docker-compose.yml` and `entrypoint.sh` if
+  you move them.
 
 ### Task language
 
