@@ -1,0 +1,50 @@
+# XFCE sandbox for the computer-use agent.
+#
+#   ./sandbox.sh up        # or: docker compose up -d --build
+#   ./sandbox.sh status    # or: docker compose ps  (shows "healthy" when
+#   ./sandbox.sh down      # the model has finished loading)
+#
+# Desktop view: http://localhost:6090/vnc.html
+#
+# GPU notes for this host (runc 1.1.x, cgroup v2, driver 580):
+#   * BOTH the nvidia reservation (deploy.resources) and the explicit
+#     devices: entries are required. The nvidia hook injects the driver
+#     libs and devices outside runc's view, so the devices must also be
+#     in the original OCI spec, or NVML fails with "Unknown Error".
+#   * If a GPU is ever removed from the machine, trim the /dev/nvidiaN
+#     list to the devices that exist.
+
+services:
+  sandbox:
+    build: .
+    image: computeruse-sandbox:latest
+    container_name: cuasandbox
+    restart: unless-stopped
+    init: true
+    shm_size: 4gb
+    ports:
+      - "6090:6090"
+    volumes:
+      - ./locatenv:/locatenv:ro
+      - ./runs:/app/runs
+    devices:
+      - /dev/nvidiactl
+      - /dev/nvidia-uvm
+      - /dev/nvidia-uvm-tools
+      - /dev/nvidia0
+      - /dev/nvidia1
+      - /dev/nvidia2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      # socket exists once the resident worker has loaded the model
+      test: ["CMD", "test", "-S", "/tmp/computeruse.sock"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 90s

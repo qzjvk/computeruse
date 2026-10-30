@@ -140,18 +140,28 @@ sent with each task. `--no-server` forces a local load. Measured on the 1070:
 ### Sandbox: let the agent click in a container, not on your desktop
 
 If you want the agent to run while you are still using the machine, give it
-its own XFCE desktop in Docker. `./sandbox.sh up` builds the image (cached
-after the first time) and starts a container with Xvfb + XFCE at 1920×1080,
-a noVNC view, and a resident `serve` worker that picks the GPU with the most
-free VRAM:
+its own XFCE desktop in Docker. It is managed with docker compose
+(`docker-compose.yml` + the `./sandbox.sh` wrapper): Xvfb + XFCE at
+1920×1080, a noVNC view, and a resident `serve` worker that picks the GPU
+with the most free VRAM. The container restarts automatically
+(`unless-stopped`) and shows as `healthy` once the model is loaded:
 
 ```bash
-./sandbox.sh up                        # build + start
+./sandbox.sh up                        # build (cached) + start
 # desktop view in your browser:  http://localhost:6090/vnc.html
 ./sandbox.sh dry "click the firefox icon"   # grounding only, no clicks
 ./sandbox.sh task "click the terminal icon in the panel; done"
-./sandbox.sh status                    # container state + recent logs
+./sandbox.sh status                    # state + recent logs (healthy = ready)
 ./sandbox.sh down
+```
+
+`./sandbox.sh up` is just `docker compose up -d --build` (plus killing a
+host-side `serve` if one is running); plain compose works too:
+
+```bash
+docker compose up -d --build
+docker compose ps        # STATUS "healthy" = model loaded
+docker compose down
 ```
 
 Everything the agent sees/clicks happens inside the container; your own

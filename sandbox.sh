@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Zero-friction control for the XFCE sandbox container.
+# Zero-friction control for the XFCE sandbox (docker compose based).
 #
 #   ./sandbox.sh up                  # build (cached) + start the sandbox
 #   ./sandbox.sh task "click ..."    # run a task through the resident worker
@@ -13,40 +13,32 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 NAME=cuasandbox
-IMG=computeruse-sandbox:latest
 
-# The nvidia hook mounts the GPU nodes but the container runtime (runc 1.1.x
-# on cgroup v2) does not learn about them; passing them as explicit --device
-# flags puts them in the original OCI spec, which is what allows open().
-gpu_devices() {
-    local args=()
-    local d
-    for d in /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia[0-9]*; do
-        [ -e "$d" ] && args+=(--device "$d")
-    done
-    printf '%s\n' "${args[@]}"
-}
+# Prefer the docker compose plugin, fall back to the docker-compose binary.
+if docker compose version >/dev/null 2>&1; then
+    COMPOSE=(docker compose)
+else
+    COMPOSE=(docker-compose)
+fi
 
 cmd=${1:-up}
 shift || true
 
 case "$cmd" in
     up)
-        # The sandbox owns the model now; drop any host-side resident worker
-        # so both are not fighting over the same VRAM.
+        # The sandbox owns the model now; drop any host-side resident
+        # worker so both are not fighting over the same VRAM.
         pkill -f "computer_use serve" 2>/dev/null || true
-        docker build -t "$IMG" .
-        docker rm -f "$NAME" 2>/dev/null || true
-        # shellcheck disable=SC2046
-        docker run -d --name "$NAME" --gpus all --shm-size 4g \
-            -v "$PWD/locatenv:/locatenv:ro" \
-            -v "$PWD/runs:/app/runs" \
-            -p 6090:6090 \
-            $(gpu_devices) \
-            "$IMG"
-        echo "Sandbox is up (model loads for ~30 s)."
+        if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" = "true" ]; then
+            echo "Sandbox is already running."
+        else
+            # Remove stale/non-compose containers with the same name.
+            docker rm -f "$NAME" 2>/dev/null || true
+            "${COMPOSE[@]}" up -d --build
+            echo "Sandbox is up (model loads for ~40 s; 'status' shows healthy when ready)."
+        fi
         echo "  Desktop:  http://localhost:6090/vnc.html"
-        echo "  Task:     $0 task \"click the firefox icon; done\""
+        echo "  Task:     $0 task \"click the address bar; done\""
         ;;
     task)
         exec docker exec "$NAME" python -m computer_use "$@"
@@ -58,11 +50,11 @@ case "$cmd" in
         exec docker exec -it "$NAME" bash
         ;;
     status)
-        docker ps -a --filter "name=$NAME"
+        "${COMPOSE[@]}" ps
         docker logs --tail 20 "$NAME" 2>/dev/null || true
         ;;
     down)
-        docker rm -f "$NAME"
+        "${COMPOSE[@]}" down
         ;;
     *)
         echo "usage: $0 {up|down|task|dry|shell|status} [args]" >&2
