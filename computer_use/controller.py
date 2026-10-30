@@ -384,40 +384,44 @@ class Agent:
         # area). Panels/bars hug a screen edge, so snap a box that touches
         # an edge to a thin strip along that edge: the crop gets smaller and
         # the target bigger in pass 2.
+        snap_x = snap_y = 0  # -1: snapped to bottom/right edge, 1: top/left
         if y2 >= h - 4 and (y2 - y1) < h * 0.75:
-            y1 = h - 120
+            y1, snap_y = h - 120, -1
         elif y1 <= 4 and (y2 - y1) < h * 0.75:
-            y2 = 120
+            y2, snap_y = 120, 1
         if x2 >= w - 4 and (x2 - x1) < w * 0.75:
-            x1 = w - 120
+            x1, snap_x = w - 120, -1
         elif x1 <= 4 and (x2 - x1) < w * 0.75:
-            x2 = 120
+            x2, snap_x = 120, 1
 
         # Expand in FULL-capture coordinates: a container (e.g. a panel) can
         # straddle tile boundaries, so the crop must come from the capture,
-        # not from whatever view produced the box.
-        m = 160
-        cx1 = max(0, int(x1) - m)
-        cy1 = max(0, int(y1) - m)
-        cx2 = min(w, int(x2) + m)
-        cy2 = min(h, int(y2) + m)
+        # not from whatever view produced the box. A snapped edge already
+        # hugs the screen, so only a small margin is needed on its inside.
+        m, m_edge = 160, 40
+        cx1 = max(0, int(x1) - (m_edge if snap_x == -1 else m))
+        cx2 = min(w, int(x2) + (m_edge if snap_x == 1 else m))
+        cy1 = max(0, int(y1) - (m_edge if snap_y == -1 else m))
+        cy2 = min(h, int(y2) + (m_edge if snap_y == 1 else m))
         if cx2 - cx1 < 28 or cy2 - cy1 < 28:
             print("    zoom: container box too small after expansion")
             return None
         crop = img.crop((cx1, cy1, cx2, cy2))
 
-        # Keep the pass-2 prefill small: shrink the crop to the token budget
-        # when it overruns, upscale small crops so the target is large.
+        # Keep the pass-2 prefill small while giving the target as many
+        # patches as possible: upscale small/thin crops (a 32 px icon in a
+        # 160 px strip becomes 64 px in 320 px -> twice the patch rows),
+        # and shrink to the token budget if that overruns it.
         budget = getattr(self.worker, "in_token_limit", None) or 2048
         cpatches = (crop.width // 14) * (crop.height // 14)
         factor = 1.0
-        if cpatches > budget:
+        if max(crop.size) < 400 or min(crop.size) <= 160:
+            factor = 2.0
+        if (int(crop.width * factor) // 14) * (int(crop.height * factor) // 14) > budget:
             factor = math.sqrt(budget / cpatches)
             while factor > 0.5 and (int(crop.width * factor) // 14) * (
                     int(crop.height * factor) // 14) > budget:
                 factor *= 0.98
-        elif max(crop.size) < 400:
-            factor = 2.0
         if factor != 1.0:
             resample = getattr(Image, "Resampling", Image)
             crop = crop.resize((max(14, int(crop.width * factor)),
@@ -425,21 +429,48 @@ class Agent:
         print(f"    zoom: 'the {container}' -> box ({x1:.0f},{y1:.0f})-({x2:.0f},{y2:.0f}) "
               f"-> crop ({cx1},{cy1})-({cx2},{cy2}) at {factor:.2f}x")
 
-        result = self.worker.point(crop, phrase, verbose=False)
-        print(f"    zoom answer: {result.answer.strip()!r}")
-        why = self._degenerate(result, crop.size[0], crop.size[1])
-        if why is None and result.center is None:
-            why = "no point/box in the answer"
-        if why is not None and self.box_fallback:
+        # Pass 2. The model can land on flat content (wallpaper) even when
+        # the target is in the crop, so candidates are scored by local
+        # edge density and must clearly stand out from the crop's own
+        # background; if the point pass is weak, a box pass is added.
+        import statistics
+        from PIL import ImageStat  # local imports
+        gray = crop.convert("L")
+
+        def _std_at(x: float, y: float) -> float:
+            r = 32
+            b = gray.crop((max(0, int(x) - r), max(0, int(y) - r),
+                           min(gray.width, int(x) + r), min(gray.height, int(y) + r)))
+            return ImageStat.Stat(b).stddev[0]
+
+        # Background level: median of a coarse grid over the crop.
+        bg = []
+        for gx in range(1, 12):
+            for gy in range(1, 7):
+                x, y = gray.width * gx / 12, gray.height * gy / 7
+                bg.append(_std_at(x, y))
+        floor = max(30.0, 1.5 * statistics.median(bg))
+
+        def _score(result) -> Optional[tuple[float, float, float]]:
+            why = self._degenerate(result, crop.size[0], crop.size[1])
+            if why is not None or result.center is None:
+                return None
+            x, y = result.center
+            s = _std_at(x, y)
+            print(f"    zoom content : local std {s:.0f} at ({x:.0f}, {y:.0f}) "
+                  f"(background floor {floor:.0f})")
+            return (s, x, y) if s >= floor else None
+
+        best = _score(self.worker.point(crop, phrase, verbose=False))
+        if best is None and self.box_fallback:
             result = self.worker.ground(crop, phrase, output_type="box", verbose=False)
             print(f"    zoom answer: (box) {result.answer.strip()!r}")
-            why = self._degenerate(result, crop.size[0], crop.size[1])
-            if why is None and result.center is None:
-                why = "no point/box in the answer"
-        if why is not None:
-            print(f"    zoom failed: {why}; falling back to normal grounding")
+            best = _score(result)
+        if best is None:
+            print("    zoom failed: no candidate on real content; "
+                  "falling back to normal grounding")
             return None
-        x, y = result.center
+        _, x, y = best
         return (cx1 + x / factor, cy1 + y / factor)
 
     def _ground_boxes(self, img, phrase: str) -> Optional[tuple[float, float, float, float]]:

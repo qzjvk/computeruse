@@ -280,34 +280,47 @@ class LocateAnythingWorker:
             )
 
         t0 = time.time()
+        # The budget assumed at load time may no longer fit (the card is
+        # shared, or the allocator is fragmented after many passes). Work
+        # down a ladder of budgets (4096 -> 2048 -> 1024); each rung is
+        # half the prefill transient of the one before.
+        old = self.in_token_limit
+        nominal = old or 2048
+        ladder = [nominal]
+        while ladder[-1] > 1024:
+            ladder.append(ladder[-1] // 2)
+        last_err = None
+        response = None
         try:
-            response = _run()
-        except RuntimeError as e:
-            if "out of memory" not in str(e).lower():
-                raise
-            # The budget assumed at load time no longer fits (the card may be
-            # shared or fragmented). Retry once at half the vision budget.
-            torch.cuda.empty_cache()
-            limit = self.in_token_limit or 2048
-            half = max(1024, limit // 2)
-            if half >= limit:
-                raise
-            old = self.in_token_limit
-            self.in_token_limit = half
-            try:
-                self.processor.image_processor.in_token_limit = half
-            except AttributeError:
-                pass
-            print(f"[worker] prefill OOM at in_token_limit={limit}; "
-                  f"retrying at {half} (card shared or fragmented)", flush=True)
-            try:
-                response = _run()
-            finally:
+            for i, lim in enumerate(ladder):
+                if lim != old:
+                    self.in_token_limit = lim
+                    try:
+                        self.processor.image_processor.in_token_limit = lim
+                    except AttributeError:
+                        pass
+                try:
+                    response = _run()
+                    break
+                except RuntimeError as e:
+                    if "out of memory" not in str(e).lower():
+                        raise
+                    torch.cuda.empty_cache()
+                    last_err = e
+                    if i + 1 >= len(ladder):
+                        break
+                    print(f"[worker] prefill OOM at in_token_limit={lim}; "
+                          f"retrying at {ladder[i + 1]} (card shared or "
+                          f"fragmented)", flush=True)
+        finally:
+            if self.in_token_limit != old:
                 self.in_token_limit = old
                 try:
                     self.processor.image_processor.in_token_limit = old
                 except AttributeError:
                     pass
+        if response is None:
+            raise last_err
         # Reclaim the prefill's transient memory before the next query.
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
