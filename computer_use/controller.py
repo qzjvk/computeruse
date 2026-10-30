@@ -55,6 +55,24 @@ _CONTAINERS = frozenset({
     "screen", "browser", "menu", "bar", "ribbon", "footer", "header",
 })
 
+# Containers that live on a screen edge (XFCE: top menu panel, bottom
+# launcher panel, tray, clock). For these, a box touching the edge is
+# snapped to the edge strip even when the box is loose (the model
+# sometimes boxes a whole screen quadrant for "the panel").
+_EDGE_CONTAINERS = frozenset({
+    "panel", "panels", "taskbar", "task bar", "dock", "tray",
+    "footer", "status bar", "menu bar", "clock",
+})
+
+# Edge containers that by definition span the whole edge (the panel, the
+# taskbar, the menu bar). For these the strip crop uses the full screen
+# length: a box covering only part of the edge is the model's guess and
+# must not clip the target out of the crop.
+_FULL_EDGE = frozenset({
+    "panel", "panels", "taskbar", "task bar", "menu bar", "dock",
+    "footer", "status bar", "sidebar", "side bar",
+})
+
 
 def _container_of(phrase: str) -> Optional[str]:
     """Return the container noun if the phrase is '<thing> in the <container>'."""
@@ -419,15 +437,23 @@ class Agent:
         # the target bigger in pass 2.
         # Only thin boxes (real strips: panels, bars) are snapped: a big
         # window that merely touches a screen edge must keep its full box,
-        # so the thinness test is 25% of the capture dimension, not 75%.
+        # so the thinness test is 25% of the capture dimension. For known
+        # edge containers (panel, taskbar, ...) the model sometimes boxes a
+        # whole screen quadrant; the edge touch is then the reliable signal,
+        # so the threshold relaxes to 60%.
+        edge = container in _EDGE_CONTAINERS
+
+        def _thin(span: float, size: float) -> bool:
+            return span < size * (0.6 if edge else 0.25)
+
         snap_x = snap_y = 0  # -1: snapped to bottom/right edge, 1: top/left
-        if y2 >= h - 4 and (y2 - y1) < h * 0.25:
+        if y2 >= h - 4 and _thin(y2 - y1, h):
             y1, snap_y = h - 120, -1
-        elif y1 <= 4 and (y2 - y1) < h * 0.25:
+        elif y1 <= 4 and _thin(y2 - y1, h):
             y2, snap_y = 120, 1
-        if x2 >= w - 4 and (x2 - x1) < w * 0.25:
+        if x2 >= w - 4 and _thin(x2 - x1, w):
             x1, snap_x = w - 120, -1
-        elif x1 <= 4 and (x2 - x1) < w * 0.25:
+        elif x1 <= 4 and _thin(x2 - x1, w):
             x2, snap_x = 120, 1
         # A box that needed no snapping is the model's own tight box
         # (e.g. a browser window): a point inside it is inside the
@@ -441,10 +467,20 @@ class Agent:
         # not from whatever view produced the box. A snapped edge already
         # hugs the screen, so only a small margin is needed on its inside.
         m, m_edge = 160, 40
-        cx1 = max(0, int(x1) - (m_edge if snap_x == -1 else m))
-        cx2 = min(w, int(x2) + (m_edge if snap_x == 1 else m))
-        cy1 = max(0, int(y1) - (m_edge if snap_y == -1 else m))
-        cy2 = min(h, int(y2) + (m_edge if snap_y == 1 else m))
+        # A full-edge container (panel, taskbar, menu bar) spans the whole
+        # edge: when it snaps to a horizontal edge the strip runs the full
+        # screen width, and to a vertical edge the full screen height. The
+        # box's extent along the edge is the model's guess, not a boundary.
+        if container in _FULL_EDGE and snap_y and not snap_x:
+            cx1, cx2 = 0, int(w)
+        else:
+            cx1 = max(0, int(x1) - (m_edge if snap_x == -1 else m))
+            cx2 = min(w, int(x2) + (m_edge if snap_x == 1 else m))
+        if container in _FULL_EDGE and snap_x and not snap_y:
+            cy1, cy2 = 0, int(h)
+        else:
+            cy1 = max(0, int(y1) - (m_edge if snap_y == -1 else m))
+            cy2 = min(h, int(y2) + (m_edge if snap_y == 1 else m))
         if cx2 - cx1 < 28 or cy2 - cy1 < 28:
             print("    zoom: container box too small after expansion")
             return None
