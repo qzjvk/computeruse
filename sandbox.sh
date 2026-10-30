@@ -2,6 +2,8 @@
 # Zero-friction control for the XFCE sandbox (docker compose based).
 #
 #   ./sandbox.sh up                  # build (cached) + start the sandbox
+#   ./sandbox.sh restart             # reload the worker only (~40 s; no
+#                                    # image rebuild, desktop/VNC untouched)
 #   ./sandbox.sh task "click ..."    # run a task through the resident worker
 #   ./sandbox.sh dry "click ..."     # dry run (grounds, does not move the mouse)
 #   ./sandbox.sh shell               # bash inside the container
@@ -43,11 +45,32 @@ case "$cmd" in
         echo "  Desktop (native):  VNC :5900 (crisp 1:1, any VNC client)"
         echo "  Task:              $0 task \"click the address bar; done\""
         ;;
+    restart)
+        # Reload the worker process only: the entrypoint's respawn loop
+        # brings serve back in ~40 s; the desktop, VNC and browser stay up.
+        # (Code is mounted live, so no image rebuild is needed for edits.)
+        docker exec "$NAME" pkill -f "computer_use[ ]serve" || true
+        # Drop the stale socket (SIGTERM skips serve's cleanup), so the
+        # health check only goes healthy when the NEW worker is ready.
+        docker exec "$NAME" rm -f /tmp/computeruse.sock || true
+        echo "worker restarting (~40 s: respawn delay + model load)..."
+        # Poll the socket, not the container health: serve binds the socket
+        # only after the model is loaded, and the health status lags a probe
+        # interval behind (it read stale-healthy right after the kill).
+        for i in $(seq 1 60); do
+            if docker exec "$NAME" test -S /tmp/computeruse.sock 2>/dev/null; then
+                echo "worker ready"; break
+            fi
+            sleep 2
+        done
+        ;;
     task)
-        exec docker exec "$NAME" python -m computer_use "$@"
+        # CUA_WAIT_SERVER: if the worker is mid-restart, wait for the socket
+        # instead of loading a second model copy on the same GPU.
+        exec docker exec -e CUA_WAIT_SERVER=120 "$NAME" python -m computer_use "$@"
         ;;
     dry)
-        exec docker exec "$NAME" python -m computer_use --dry-run "$@"
+        exec docker exec -e CUA_WAIT_SERVER=120 "$NAME" python -m computer_use --dry-run "$@"
         ;;
     shell)
         exec docker exec -it "$NAME" bash
@@ -60,7 +83,7 @@ case "$cmd" in
         "${COMPOSE[@]}" down
         ;;
     *)
-        echo "usage: $0 {up|down|task|dry|shell|status} [args]" >&2
+        echo "usage: $0 {up|down|restart|task|dry|shell|status} [args]" >&2
         exit 2
         ;;
 esac

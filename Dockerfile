@@ -28,7 +28,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY computer_use/ ./computer_use/
+# requirements.txt first: it rarely changes, so the big pip layer stays
+# cached. The code itself is live-mounted by docker-compose.yml
+# (./computer_use -> /app/computer_use), so edits never force a rebuild;
+# the COPY below is just a fallback for running the image standalone.
 COPY requirements.txt .
 
 # torch first (own index, big), then the rest of the stack.
@@ -36,6 +39,8 @@ RUN pip install --no-cache-dir \
         torch==2.5.1 torchvision==0.20.1 \
         --index-url https://download.pytorch.org/whl/cu124 \
     && pip install --no-cache-dir -r requirements.txt
+
+COPY computer_use/ ./computer_use/
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

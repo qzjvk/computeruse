@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -117,14 +118,27 @@ def main(argv: list[str] | None = None) -> int:
 
     # Agent mode: use the resident worker when one is up (skips the ~25 s load)
     if not args.no_server:
-        resp = server.send_task({
+        # CUA_WAIT_SERVER (seconds): while the worker is mid-restart the
+        # socket is briefly missing; wait for it instead of loading a second
+        # model copy on the same GPU (which would OOM the card).
+        wait = max(0, int(os.environ.get("CUA_WAIT_SERVER", "0") or 0))
+        req = {
             "kind": "task", "task": task,
             "scope": args.scope,
             "dry_run": args.dry_run, "delay": args.delay,
             "max_steps": args.max_steps, "monitor": args.monitor,
             "save_dir": args.save_dir or None,
             "box_fallback": not args.no_box_fallback,
-        })
+        }
+        resp = None
+        deadline = time.time() + wait
+        while True:
+            resp = server.send_task(req)
+            if resp is not None or time.time() >= deadline:
+                break
+            print("[client] worker not ready yet (restarting?); waiting...",
+                  flush=True)
+            time.sleep(2)
         if resp is not None:
             print(resp.get("log", ""), end="")
             if "error" in resp:

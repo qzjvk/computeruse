@@ -37,9 +37,10 @@ def parse_boxes(answer: str, image_width: int, image_height: int) -> list[tuple[
     """Extract 4-coordinate boxes as (x1, y1, x2, y2) pixel rects.
 
     The model's coordinate order varies by decode path ((x1,x2,y1,y2) or
-    (x1,y1,x2,y2)), so both are tried and the larger-area interpretation is
-    kept: the cross-interpretation scrambles a real box into a smaller (or
-    degenerate) one.
+    (x1,y1,x2,y2)), so both are tried. The reading whose coordinate pairs
+    are already ordered (no swaps) wins, ties breaking to the larger area:
+    a pure area test scrambles thin strips (141x606 beats the real
+    797x50 bar), moving the target far off.
     """
     boxes: list[tuple[float, float, float, float]] = []
     for m in _BOX_RE.finditer(answer):
@@ -52,7 +53,15 @@ def parse_boxes(answer: str, image_width: int, image_height: int) -> list[tuple[
         aya, ayb = min(c3, c4), max(c3, c4)
         bxa, bxb = min(c1, c3), max(c1, c3)
         bya, byb = min(c2, c4), max(c2, c4)
-        if (bxb - bxa) * (byb - bya) > (axb - axa) * (ayb - aya):
+        # Prefer the interpretation whose pairs are already ordered (no
+        # swaps): a sane box reads x1<x2, y1<y2 in its own convention.
+        # A pure area test scrambles thin strips: the wrong reading of
+        # (34,175,831,225) measures 141x606 and beats the real 797x50 bar.
+        sw_a = (c1 > c2) + (c3 > c4)
+        sw_b = (c1 > c3) + (c2 > c4)
+        area_a = (axb - axa) * (ayb - aya)
+        area_b = (bxb - bxa) * (byb - bya)
+        if sw_b < sw_a or (sw_b == sw_a and area_b > area_a):
             xa, xb, ya, yb = bxa, bxb, bya, byb
         else:
             xa, xb, ya, yb = axa, axb, aya, ayb

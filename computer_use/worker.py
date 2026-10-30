@@ -244,7 +244,7 @@ class LocateAnythingWorker:
         image: ImageLike,
         question: str,
         generation_mode: str = "hybrid",   # "fast" (MTP) | "slow" (AR) | "hybrid"
-        max_new_tokens: int = 2048,
+        max_new_tokens: int = 512,
         temperature: float = 0.0,
         verbose: Optional[bool] = None,
     ) -> dict:
@@ -289,10 +289,32 @@ class LocateAnythingWorker:
         ladder = [nominal]
         while ladder[-1] > 1024:
             ladder.append(ladder[-1] // 2)
+        # Skip rungs that cannot fit right now. An OOM attempt costs a full
+        # prefill (~40-60 s on the 1070); mem_get_info is free. The
+        # transient prefill footprint is ~140 MiB per 1024 vision tokens +
+        # ~64 MiB overhead (measured on the 1070); leave 128 MiB headroom.
+        start = 0
+        if self.device.type == "cuda":
+            idx = (self.device.index if self.device.index is not None
+                   else torch.cuda.current_device())
+            free, _ = torch.cuda.mem_get_info(idx)
+            mib = 1024 * 1024
+            transient = lambda lim: (lim // 1024) * 140 * mib + 64 * mib
+            for j in range(len(ladder)):
+                if transient(ladder[j]) <= free - 128 * mib:
+                    start = j
+                    break
+            else:
+                start = len(ladder) - 1
+            if start > 0:
+                print(f"[worker] only {free / mib:.0f} MiB free on cuda:{idx}; "
+                      f"starting at in_token_limit={ladder[start]} instead "
+                      f"of {nominal} (avoids an OOM prefill)", flush=True)
         last_err = None
         response = None
         try:
-            for i, lim in enumerate(ladder):
+            for i in range(start, len(ladder)):
+                lim = ladder[i]
                 if lim != old:
                     self.in_token_limit = lim
                     try:

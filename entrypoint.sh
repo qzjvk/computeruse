@@ -49,4 +49,13 @@ for i in range(torch.cuda.device_count()):
 " 2>/dev/null || true)
 
 cd /app
-exec python -m computer_use serve --model /locatenv --scope window ${GPU1070:+--gpu "$GPU1070"}
+# Run the resident worker in a respawn loop instead of exec-ing it:
+# `docker exec cuasandbox pkill -f 'computer_use[ ]serve'` then restarts ONLY
+# the worker (~40 s: 5 s delay + model load) without resetting the desktop,
+# the VNC session or the browser. Code changes need no image rebuild —
+# the container mounts the host's computer_use/ live.
+while true; do
+    python -m computer_use serve --model /locatenv --scope window ${GPU1070:+--gpu "$GPU1070"} || rc=$?
+    echo "[sandbox] worker exited (code ${rc:-0}); restarting in 5 s"
+    sleep 5
+done

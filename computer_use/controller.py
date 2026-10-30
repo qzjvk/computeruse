@@ -258,14 +258,14 @@ class Agent:
         if view is not None:
             result = self.worker.point(view, phrase, verbose=False)
             print(f"    raw answer : {result.answer.strip()!r}")
-            why = self._degenerate(result, view.size[0], view.size[1])
+            why = self._degenerate(result, view.size[0], view.size[1], "point")
             if why is None and result.center is None:
                 why = "no point/box in the answer"
             if why is not None and self.box_fallback:
                 print(f"    point answer rejected ({why}); retrying with box prompt")
                 result = self.worker.ground(view, phrase, output_type="box", verbose=False)
                 print(f"    box answer : {result.answer.strip()!r}")
-                why = self._degenerate(result, view.size[0], view.size[1])
+                why = self._degenerate(result, view.size[0], view.size[1], "box")
                 if why is None and result.center is None:
                     why = "no point/box in the answer"
             if why is not None:
@@ -297,12 +297,12 @@ class Agent:
                 print(f"    tile {i} answer   : (box) {result.answer.strip()!r}")
             else:
                 print(f"    tile {i} answer   : {result.answer.strip()!r}")
-            why = self._degenerate(result, tw, th)
+            why = self._degenerate(result, tw, th, "point")
             if why is not None and self.box_fallback:
                 print(f"    tile {i} point spam ({why}); retrying with box prompt")
                 result = self.worker.ground(tile, phrase, output_type="box", verbose=False)
                 print(f"    tile {i} answer   : (box) {result.answer.strip()!r}")
-                why = self._degenerate(result, tw, th)
+                why = self._degenerate(result, tw, th, "box")
                 if why is None and result.center is None:
                     why = "no point/box in the answer"
             if why is not None:
@@ -350,7 +350,23 @@ class Agent:
         crop of the capture, shrunk to fit the budget or upscaled when
         small. Returns capture pixels, or None to fall back to the normal
         path.
+
+        The decode is stochastic on legacy hardware (the same prompt can
+        box a 120 px corner for a full-window container in one run and the
+        window itself in the next), so the whole zoom is retried once when
+        it fails.
         """
+        for attempt in (1, 2):
+            zt = self._zoom_attempt(img, phrase, container)
+            if zt is not None:
+                return zt
+            if attempt == 1:
+                print("    zoom: attempt 1 failed; retrying once "
+                      "(decode varies between attempts)")
+        return None
+
+    def _zoom_attempt(self, img, phrase: str, container: str) -> Optional[tuple[float, float]]:
+        """One full pass-1 + pass-2 attempt. Returns capture pixels or None."""
         import math
         from PIL import Image  # local import
 
@@ -362,19 +378,36 @@ class Agent:
             # container plus a margin is a usable crop.
             result = self.worker.point(img, f"the {container}", verbose=False)
             print(f"    zoom point   : {result.answer.strip()!r}")
-            why = self._degenerate(result, w, h)
+            why = self._degenerate(result, w, h, "point")
             if why is not None or result.center is None:
                 return None
             x, y = result.center
-            m = 160.0
+            m = 320.0
             return (max(0.0, x - m), max(0.0, y - m),
                     min(float(w), x + m), min(float(h), y + m))
 
+        def _usable(b) -> bool:
+            # Unusable: absent, microscopic, whole-frame, or a tiny box in
+            # a screen corner (the model's failure mode: e.g.
+            # (0,0)-(120,120) when asked to box a full-window container).
+            # Thin-but-real strips (tab bars) are kept.
+            if b is None:
+                return False
+            x1, y1, x2, y2 = b
+            bw, bh = x2 - x1, y2 - y1
+            if bw < 8 or bh < 8 or bw * bh > 0.9 * w * h:
+                return False
+            if bw * bh < 0.04 * w * h and (
+                    (x1 <= 4 or x2 >= w - 4) and (y1 <= 4 or y2 >= h - 4)):
+                return False
+            return True
+
         box = self._ground_boxes(img, f"the {container}")
-        if (box is None
-                or box[2] - box[0] < 8
-                or box[3] - box[1] < 8
-                or (box[2] - box[0]) * (box[3] - box[1]) > 0.9 * w * h):
+        if not _usable(box):
+            print(f"    zoom: box for 'the {container}' unusable ({box}); "
+                  "retrying box prompt")
+            box = self._ground_boxes(img, f"the {container}")
+        if not _usable(box):
             box = _point_box()
             if box is None:
                 print(f"    zoom: no usable box/point for 'the {container}'")
@@ -384,15 +417,24 @@ class Agent:
         # area). Panels/bars hug a screen edge, so snap a box that touches
         # an edge to a thin strip along that edge: the crop gets smaller and
         # the target bigger in pass 2.
+        # Only thin boxes (real strips: panels, bars) are snapped: a big
+        # window that merely touches a screen edge must keep its full box,
+        # so the thinness test is 25% of the capture dimension, not 75%.
         snap_x = snap_y = 0  # -1: snapped to bottom/right edge, 1: top/left
-        if y2 >= h - 4 and (y2 - y1) < h * 0.75:
+        if y2 >= h - 4 and (y2 - y1) < h * 0.25:
             y1, snap_y = h - 120, -1
-        elif y1 <= 4 and (y2 - y1) < h * 0.75:
+        elif y1 <= 4 and (y2 - y1) < h * 0.25:
             y2, snap_y = 120, 1
-        if x2 >= w - 4 and (x2 - x1) < w * 0.75:
+        if x2 >= w - 4 and (x2 - x1) < w * 0.25:
             x1, snap_x = w - 120, -1
-        elif x1 <= 4 and (x2 - x1) < w * 0.75:
+        elif x1 <= 4 and (x2 - x1) < w * 0.25:
             x2, snap_x = 120, 1
+        # A box that needed no snapping is the model's own tight box
+        # (e.g. a browser window): a point inside it is inside the
+        # container, so it is trusted even on flat surfaces (an address
+        # bar is plain white). Snapped strips keep the content gate,
+        # because a loose box spills onto the wallpaper.
+        trust_box = (snap_x == 0 and snap_y == 0)
 
         # Expand in FULL-capture coordinates: a container (e.g. a panel) can
         # straddle tile boundaries, so the crop must come from the capture,
@@ -451,21 +493,31 @@ class Agent:
                 bg.append(_std_at(x, y))
         floor = max(30.0, 1.5 * statistics.median(bg))
 
-        def _score(result) -> Optional[tuple[float, float, float]]:
-            why = self._degenerate(result, crop.size[0], crop.size[1])
+        def _score(result, kind: str) -> Optional[tuple[float, float, float]]:
+            why = self._degenerate(result, crop.size[0], crop.size[1], kind)
             if why is not None or result.center is None:
                 return None
             x, y = result.center
             s = _std_at(x, y)
+            fx, fy = cx1 + x / factor, cy1 + y / factor
+            if trust_box and (x1 - 4 <= fx <= x2 + 4) and (y1 - 4 <= fy <= y2 + 4):
+                print(f"    zoom content : local std {s:.0f} at ({x:.0f}, {y:.0f}) "
+                      f"inside container box -> accepted")
+                return (s, x, y)
             print(f"    zoom content : local std {s:.0f} at ({x:.0f}, {y:.0f}) "
                   f"(background floor {floor:.0f})")
             return (s, x, y) if s >= floor else None
 
-        best = _score(self.worker.point(crop, phrase, verbose=False))
+        # The crop IS the container, so ground the bare target phrase in it
+        # ("the address bar", not "the address bar in the browser" - the
+        # container clause is noise when the container fills the view).
+        bare = _CONTAINER_RE.sub("", phrase).strip() or phrase
+
+        best = _score(self.worker.point(crop, bare, verbose=False), "point")
         if best is None and self.box_fallback:
-            result = self.worker.ground(crop, phrase, output_type="box", verbose=False)
+            result = self.worker.ground(crop, bare, output_type="box", verbose=False)
             print(f"    zoom answer: (box) {result.answer.strip()!r}")
-            best = _score(result)
+            best = _score(result, "box")
         if best is None:
             print("    zoom failed: no candidate on real content; "
                   "falling back to normal grounding")
@@ -482,7 +534,7 @@ class Agent:
         """
         result = self.worker.ground(img, phrase, output_type="box", verbose=False)
         print(f"    zoom box     : {result.answer.strip()!r}")
-        why = self._degenerate(result, img.width, img.height)
+        why = self._degenerate(result, img.width, img.height, "box")
         if why is not None:
             print(f"    zoom box rejected: {why}")
             return None
@@ -496,35 +548,40 @@ class Agent:
         return None
 
     @staticmethod
-    def _degenerate(result: GroundingResult, w: int, h: int) -> Optional[str]:
+    def _degenerate(result: GroundingResult, w: int, h: int,
+                    kind: str = "both") -> Optional[str]:
         """Why a model answer is unusable, or None if it looks sane.
 
         Catches the failure modes seen on small GPUs: decoding spam (dozens
         of boxes) and degenerate repeats (identical or full-frame boxes)
-        that would otherwise make us click a random spot.
+        that would otherwise make us click a random spot. ``kind`` scopes
+        the checks to the output actually used: a point answer commonly
+        trails decode-spam boxes that must not disqualify a good point.
         """
         from collections import Counter
 
-        boxes = result.boxes
-        if boxes:
-            if len(boxes) > 20:
-                return f"{len(boxes)} boxes (decoding spam)"
-            full = sum(
-                1 for b in boxes
-                if b[0] <= 2 and b[1] <= 2 and b[2] >= w - 2 and b[3] >= h - 2
-            )
-            if full > 1:
-                return f"{full} full-frame boxes"
-            common, n = Counter(boxes).most_common(1)[0]
-            if n >= 3 and n * 2 > len(boxes):
-                return f"{n} identical boxes"
-            if n >= 2 and common[0] <= 2 and common[1] <= 2:
-                return f"{n} identical boxes at the image corner"
-        pts = result.points
-        if pts:
-            _, n = Counter(pts).most_common(1)[0]
-            if n >= 3 and n * 2 > len(pts):
-                return f"{n} identical points"
+        if kind in ("both", "box"):
+            boxes = result.boxes
+            if boxes:
+                if len(boxes) > 20:
+                    return f"{len(boxes)} boxes (decoding spam)"
+                full = sum(
+                    1 for b in boxes
+                    if b[0] <= 2 and b[1] <= 2 and b[2] >= w - 2 and b[3] >= h - 2
+                )
+                if full > 1:
+                    return f"{full} full-frame boxes"
+                common, n = Counter(boxes).most_common(1)[0]
+                if n >= 3 and n * 2 > len(boxes):
+                    return f"{n} identical boxes"
+                if n >= 2 and common[0] <= 2 and common[1] <= 2:
+                    return f"{n} identical boxes at the image corner"
+        if kind in ("both", "point"):
+            pts = result.points
+            if pts:
+                _, n = Counter(pts).most_common(1)[0]
+                if n >= 3 and n * 2 > len(pts):
+                    return f"{n} identical points"
         return None
 
 

@@ -29,6 +29,9 @@ services:
       - "5900:5900"   # raw VNC (native clients: crisp 1:1, no web lag)
     volumes:
       - ./locatenv:/locatenv:ro
+      # Live code mount: edits on the host take effect after
+      # `./sandbox.sh restart` (worker reload, ~40 s) - no image rebuild.
+      - ./computer_use:/app/computer_use
       - ./runs:/app/runs
     devices:
       - /dev/nvidiactl
