@@ -9,6 +9,10 @@ Examples:
 
     # Real run
     python -m computer_use "click File; click New; type hello"
+
+    # Resident worker: load the model once, then every run skips the ~25 s load
+    python -m computer_use serve --scope window
+    python -m computer_use "click File; click New"   # auto-connects when up
 """
 
 from __future__ import annotations
@@ -55,12 +59,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--save-dir", default="runs", help="Where to save step screenshots ('' to disable)")
     p.add_argument("--no-box-fallback", action="store_true",
                    help="Do not retry with box grounding when point grounding returns nothing")
+    p.add_argument("--no-server", action="store_true",
+                   help="Load the model locally even if a resident 'serve' worker is running")
     p.add_argument("--quiet", action="store_true", help="Suppress worker banners/progress")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    # Resident worker: keep the model loaded and serve tasks over a socket.
+    # Model-level options (--model/--gpu/--dtype/--attn/--scope/...) are fixed
+    # by this invocation; per-run options (--dry-run/--delay/...) come with
+    # each task.
+    if args.task == ["serve"]:
+        from . import server
+
+        server.WorkerServer(args).serve_forever()
+        return 0
 
     task = None
     if args.task_file:
@@ -73,40 +89,23 @@ def main(argv: list[str] | None = None) -> int:
         print(__doc__)
         return 2
 
-    import torch
-
-    from .worker import LocateAnythingWorker
-
-    dtype = None
-    if args.dtype == "fp16":
-        dtype = torch.float16
-    elif args.dtype == "bf16":
-        dtype = torch.bfloat16
-
-    vit_cpu = {"auto": "auto", "on": True, "off": False}[args.vit_cpu]
-
-    # Agent scope: window grounding wants the highest token budget the card
-    # can afford (near-native resolution for typical windows); full-monitor
-    # grounding gets the conservative budget.
-    if args.image:
-        scope, limit = "screen", args.in_token_limit
-    elif args.scope == "window":
-        scope, limit = "window", args.in_token_limit if args.in_token_limit else 4096
-    else:
-        scope, limit = "screen", args.in_token_limit
-
-    worker = LocateAnythingWorker(
-        model_path=args.model,
-        device=args.gpu,
-        dtype=dtype,
-        attn=args.attn,
-        in_token_limit=limit,
-        vit_cpu=vit_cpu,
-        verbose=not args.quiet,
-    )
+    from . import server
 
     # Offline grounding mode
     if args.image and args.query:
+        if not args.no_server:
+            resp = server.send_task({
+                "kind": "offline", "image": args.image,
+                "query": args.query, "output_type": args.output_type,
+            })
+            if resp is not None:
+                print(resp.get("log", ""), end="")
+                if "error" in resp:
+                    print(resp["error"])
+                    return 1
+                return 0 if resp["ok"] else 1
+
+        worker, _scope = server.build_worker(args)
         from .controller import offline_ground
 
         res = offline_ground(
@@ -116,7 +115,23 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0 if res.center else 1
 
-    # Agent mode
+    # Agent mode: use the resident worker when one is up (skips the ~25 s load)
+    if not args.no_server:
+        resp = server.send_task({
+            "kind": "task", "task": task,
+            "dry_run": args.dry_run, "delay": args.delay,
+            "max_steps": args.max_steps, "monitor": args.monitor,
+            "save_dir": args.save_dir or None,
+            "box_fallback": not args.no_box_fallback,
+        })
+        if resp is not None:
+            print(resp.get("log", ""), end="")
+            if "error" in resp:
+                print(resp["error"])
+                return 1
+            return 0 if resp["ok"] else 1
+
+    worker, scope = server.build_worker(args)
     from .controller import Agent
 
     agent = Agent(

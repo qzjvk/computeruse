@@ -114,6 +114,65 @@ res = worker.point("screenshot.png", "the search box")
 print(res.center)                                   # (x, y) in image pixels
 ```
 
+### Resident worker (`serve`)
+
+Every local run pays a ~25 s model load, which on the 1070 is as long as the
+grounding itself. A resident worker keeps the model in VRAM and serves tasks
+over a Unix socket (`/tmp/computeruse.sock`, override with `CUA_SOCKET`):
+
+```bash
+# terminal 1 — load the model once (same model flags as a normal run)
+python -m computer_use serve --scope window
+
+# terminal 2 — each run auto-connects and skips the load
+python -m computer_use "click the search bar"
+python -m computer_use --dry-run "click File; click New"
+python -m computer_use --image screenshot.png --query "the gear"
+```
+
+Model-level options (`--model/--gpu/--dtype/--attn/--in-token-limit/--scope/
+--vit-cpu`) are fixed by the `serve` invocation; per-run options (`--dry-run`,
+`--delay`, `--max-steps`, `--monitor`, `--save-dir`, `--no-box-fallback`) are
+sent with each task. `--no-server` forces a local load. Measured on the 1070:
+~90 s per run without the worker vs ~35–45 s with it (2 tiled passes at
+4096 tokens remain the bottleneck — that is Pascal prefill, not startup).
+
+### Sandbox: let the agent click in a container, not on your desktop
+
+If you want the agent to run while you are still using the machine, give it
+its own XFCE desktop in Docker. `./sandbox.sh up` builds the image (cached
+after the first time) and starts a container with Xvfb + XFCE at 1920×1080,
+a noVNC view, and a resident `serve` worker that picks the GPU with the most
+free VRAM:
+
+```bash
+./sandbox.sh up                        # build + start
+# desktop view in your browser:  http://localhost:6090/vnc.html
+./sandbox.sh dry "click the firefox icon"   # grounding only, no clicks
+./sandbox.sh task "click the terminal icon in the panel; done"
+./sandbox.sh status                    # container state + recent logs
+./sandbox.sh down
+```
+
+Everything the agent sees/clicks happens inside the container; your own
+session is never touched. Step screenshots land in `runs/` on the host.
+
+Notes:
+
+- The container gets the GPUs via `--gpus all` **plus explicit `--device`
+  flags for `/dev/nvidia*`. On this host (runc 1.1.x, cgroup v2) the nvidia
+  hook's device injection is not visible to runc, so unprivileged GPU
+  access needs the `--device` flags (NVML otherwise fails with
+  "Unknown Error"). `sandbox.sh` builds the flag list from whatever
+  `/dev/nvidia*` nodes exist.
+- The GPU's kernel driver lives on the host; `entrypoint.sh` symlinks the
+  host driver libs that the nvidia hook mounts so `libnvidia-ml.so.1`
+  matches the kernel module.
+- `locatenv/` is bind-mounted read-only into the container, so no copy of
+  the weights is needed.
+- Port 6090 is used because 6080 is already taken on this host; change both
+  `entrypoint.sh` and `sandbox.sh` if you move it.
+
 ### Task language
 
 Steps are separated by `;` or newlines. A bare phrase is treated as `click`.
@@ -170,7 +229,11 @@ computer_use/
 ├── screen.py       # mss screenshot capture + monitor coordinate mapping
 ├── actions.py      # pyautogui click/type/key/scroll (dry-run aware)
 ├── controller.py   # task language + perceive→ground→act loop
-└── __main__.py     # CLI
+├── server.py       # resident worker: model stays in VRAM, tasks over a Unix socket
+└── __main__.py     # CLI (agent / offline / serve)
+Dockerfile          # XFCE sandbox image (Xvfb + noVNC + agent)
+entrypoint.sh       # sandbox entrypoint: desktop + VNC + serve
+sandbox.sh          # host wrapper: up/down/task/dry/status
 locatenv/           # model weights (git-ignored)
 ```
 

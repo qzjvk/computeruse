@@ -18,6 +18,7 @@ Implementation notes (verified empirically on this box):
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
 from typing import Optional
@@ -33,8 +34,15 @@ _XDISPLAY = None
 def _sct():
     global _SCT
     if _SCT is None:
+        # CUA_MSS_BACKEND selects the mss X11 backend (mss >= 10). The
+        # default (XCB + XShmGetImage) returns corrupted frames on Xvfb;
+        # the sandbox sets "xlib" (legacy Xlib XGetImage) which is clean.
+        backend = os.environ.get("CUA_MSS_BACKEND", "default")
         maker = getattr(mss, "MSS", None) or mss.mss  # MSS in mss >= 10
-        _SCT = maker()
+        try:
+            _SCT = maker(backend=backend)
+        except TypeError:
+            _SCT = maker()  # older mss without backend support
     return _SCT
 
 
