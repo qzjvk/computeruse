@@ -51,9 +51,17 @@ see, so the agent manages its capture:
   container (panel, tab bar, toolbar, address bar, title bar, …), the
   agent first *boxes the container* (large and easy, one pass over the
   whole capture), then re-grounds the original phrase in a margin-expanded
-  crop of it — upscaled when small. Edge-hugging containers (panels,
+  crop of it — upscaled when small. The container clause is dropped in
+  that second pass: "the address bar", not "the address bar in the
+  browser" (the crop already is the container, and the clause only
+  confuses the model). Points landing back inside the container box are
+  trusted even on flat content (an address bar is plain white).
+  Edge-hugging containers (panels,
   bars) are snapped to a thin strip along the screen edge so the crop
-  stays small. If the container can't be boxed (point prompt fallback
+  stays small. Tiny corner boxes — the model's failure mode for
+  full-window containers — are rejected with one box retry, and the
+  whole zoom runs again once on failure (decodes vary between runs). If
+  the container still can't be boxed (point prompt fallback
   first, then the normal path), zoom is skipped and the normal strategy
   runs. Measured: "terminal icon in the panel" 45 s, "plus button in the
   tab bar" 55 s, both within a few px of the real target.
@@ -177,6 +185,7 @@ and shows as `healthy` once the model is loaded:
 
 ```bash
 ./sandbox.sh up                        # build (cached) + start
+./sandbox.sh restart                   # reload the worker only (~40 s)
 # desktop view, two ways:
 #   browser:  http://localhost:6090/vnc.html   (noVNC)
 #   native:   VNC :5900  (any VNC client; crisp 1:1, less lag)
