@@ -58,7 +58,12 @@ see, so the agent manages its capture:
   trusted even on flat content (an address bar is plain white).
   Edge-hugging containers (panels,
   bars) are snapped to a thin strip along the screen edge so the crop
-  stays small. Tiny corner boxes — the model's failure mode for
+  stays small; a loose box for such a container (a whole quadrant, half
+  the edge) still snaps, because the edge touch is the reliable signal.
+  For full-length containers (panel, taskbar, menu bar) the strip runs
+  the whole screen edge, so a box covering only part of it cannot clip
+  the target out of the crop.
+  Tiny corner boxes — the model's failure mode for
   full-window containers — are rejected with one box retry, and the
   whole zoom runs again once on failure (decodes vary between runs). If
   the container still can't be boxed (point prompt fallback
