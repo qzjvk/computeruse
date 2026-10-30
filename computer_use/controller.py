@@ -421,15 +421,23 @@ class Agent:
             return True
 
         box = self._ground_boxes(img, f"the {container}")
-        if not _usable(box):
+        whole_frame = (box is not None and
+                       (box[2] - box[0]) * (box[3] - box[1]) > 0.9 * w * h)
+        if whole_frame:
+            # The container fills the capture (e.g. the active window is the
+            # browser and the phrase is "… in the browser"): a whole-frame
+            # box is the correct answer, not garbage — the crop is the whole
+            # capture and pass 2 grounds the target in it (one less retry).
+            box = (0.0, 0.0, float(w), float(h))
+        elif not _usable(box):
             print(f"    zoom: box for 'the {container}' unusable ({box}); "
                   "retrying box prompt")
             box = self._ground_boxes(img, f"the {container}")
-        if not _usable(box):
-            box = _point_box()
-            if box is None:
-                print(f"    zoom: no usable box/point for 'the {container}'")
-                return None
+            if not _usable(box):
+                box = _point_box()
+                if box is None:
+                    print(f"    zoom: no usable box/point for 'the {container}'")
+                    return None
         x1, y1, x2, y2 = box
         # Models box containers loosely (the box spills into the surrounding
         # area). Panels/bars hug a screen edge, so snap a box that touches
