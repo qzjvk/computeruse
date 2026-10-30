@@ -1,0 +1,19 @@
+# Local model weights (NVIDIA LocateAnything-3B) — see README for download
+locatenv/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Runtime artifacts
+runs/
+*.grounded.png
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

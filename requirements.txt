@@ -1,0 +1,22 @@
+# Python 3.10-3.12 recommended.
+#
+# IMPORTANT for legacy GPUs (GTX 1070 / Pascal sm_61):
+#   torch 2.5.1 is the LAST PyTorch release with sm_61 kernels, and it has no
+#   Python 3.13 wheels. Install torch from the cu124 index:
+#
+#   pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
+#
+# On modern GPUs (sm_80+, e.g. RTX 30/40/50) any recent torch works.
+torch==2.5.1
+torchvision==0.20.1
+transformers==4.57.1
+peft>=0.13
+# required by the model's remote code (checked by transformers' import check)
+decord==0.6.0
+lmdb==1.7.5
+numpy
+Pillow>=10
+opencv-python-headless>=4.9
+mss>=9
+pyautogui>=0.9.54
+python-xlib>=0.5.14

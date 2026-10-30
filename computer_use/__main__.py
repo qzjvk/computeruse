@@ -1,0 +1,137 @@
+"""CLI entry point: ``python -m computer_use ...``
+
+Examples:
+    # Offline grounding on an image (no screen control)
+    python -m computer_use --image assets/demo.png --query "the search box"
+
+    # Dry run of a task (grounds + prints targets, no mouse movement)
+    python -m computer_use --dry-run "click the start menu; type firefox; key enter"
+
+    # Real run
+    python -m computer_use "click File; click New; type hello"
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="computer_use",
+        description="Computer-use agent powered by NVIDIA LocateAnything-3B.",
+    )
+    p.add_argument("task", nargs="*", help="Task to execute (see README for the step language)")
+    p.add_argument("--task-file", help="Read the task from a file (overrides positional task)")
+    p.add_argument("--image", help="Offline grounding mode: path to an image")
+    p.add_argument("--query", help="Phrase to ground (offline mode)")
+    p.add_argument("--output-type", choices=["point", "box"], default="point",
+                   help="Offline mode: ground as point (default) or box")
+
+    p.add_argument("--model", default=os.environ.get("LOCATEANYTHING_MODEL", "locatenv"),
+                   help="Path to the model directory (default: $LOCATEANYTHING_MODEL or ./locatenv)")
+    p.add_argument("--gpu", help="CUDA device, e.g. '0' or 'cuda:2'. Default: most free VRAM")
+    p.add_argument("--dtype", choices=["fp16", "bf16"], help="Weight dtype (default: bf16 on sm_80+, fp16 elsewhere)")
+    p.add_argument("--attn", choices=["sdpa", "eager", "flash_attention_2", "magi"],
+                   help="Attention implementation (default: sdpa)")
+    p.add_argument("--in-token-limit", type=int, default=None,
+                   help="Max vision patch tokens (default auto: 1024 on legacy GPUs, 2048 elsewhere; raise on big-VRAM GPUs, e.g. 4096/25600)")
+    p.add_argument("--vit-cpu", choices=["auto", "on", "off"], default="auto",
+                   help="Run the MoonViT vision encoder on the CPU (default auto: on for sm<8 / 8 GB cards)")
+    p.add_argument("--generation-mode", choices=["hybrid", "fast", "slow"], default="hybrid")
+    p.add_argument("--max-new-tokens", type=int, default=2048)
+    p.add_argument("--temperature", type=float, default=0.0,
+                   help="Sampling temperature; 0 = greedy (recommended for the agent)")
+    p.add_argument("--verbose", action="store_true", help="Print per-step model statistics")
+
+    p.add_argument("--dry-run", action="store_true", help="Ground and log actions but do not move the mouse")
+    p.add_argument("--scope", choices=["window", "screen"], default="window",
+                   help="Capture scope: the active window (default, near-native resolution) or the full monitor")
+    p.add_argument("--delay", type=float, default=0.8, help="Pause after each action (seconds)")
+    p.add_argument("--max-steps", type=int, default=32)
+    p.add_argument("--monitor", type=int, help="Monitor index for screenshots (default: mouse position)")
+    p.add_argument("--save-dir", default="runs", help="Where to save step screenshots ('' to disable)")
+    p.add_argument("--no-box-fallback", action="store_true",
+                   help="Do not retry with box grounding when point grounding returns nothing")
+    p.add_argument("--quiet", action="store_true", help="Suppress worker banners/progress")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    task = None
+    if args.task_file:
+        task = open(args.task_file).read()
+    elif args.task:
+        task = " ".join(args.task)
+    elif args.image and args.query:
+        task = None  # offline grounding mode
+    if not (task or (args.image and args.query)):
+        print(__doc__)
+        return 2
+
+    import torch
+
+    from .worker import LocateAnythingWorker
+
+    dtype = None
+    if args.dtype == "fp16":
+        dtype = torch.float16
+    elif args.dtype == "bf16":
+        dtype = torch.bfloat16
+
+    vit_cpu = {"auto": "auto", "on": True, "off": False}[args.vit_cpu]
+
+    # Agent scope: window grounding wants the highest token budget the card
+    # can afford (near-native resolution for typical windows); full-monitor
+    # grounding gets the conservative budget.
+    if args.image:
+        scope, limit = "screen", args.in_token_limit
+    elif args.scope == "window":
+        scope, limit = "window", args.in_token_limit if args.in_token_limit else 4096
+    else:
+        scope, limit = "screen", args.in_token_limit
+
+    worker = LocateAnythingWorker(
+        model_path=args.model,
+        device=args.gpu,
+        dtype=dtype,
+        attn=args.attn,
+        in_token_limit=limit,
+        vit_cpu=vit_cpu,
+        verbose=not args.quiet,
+    )
+
+    # Offline grounding mode
+    if args.image and args.query:
+        from .controller import offline_ground
+
+        res = offline_ground(
+            worker, args.image, args.query,
+            output_type=args.output_type,
+            save_dir=args.save_dir or None,
+        )
+        return 0 if res.center else 1
+
+    # Agent mode
+    from .controller import Agent
+
+    agent = Agent(
+        worker,
+        dry_run=args.dry_run,
+        delay=args.delay,
+        max_steps=args.max_steps,
+        scope=scope,
+        monitor=args.monitor,
+        save_dir=args.save_dir or None,
+        box_fallback=not args.no_box_fallback,
+    )
+    ok = agent.run(task)
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
