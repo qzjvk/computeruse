@@ -247,6 +247,7 @@ class LocateAnythingWorker:
         max_new_tokens: int = 512,
         temperature: float = 0.0,
         verbose: Optional[bool] = None,
+        stop_after_first_box: bool = False,
     ) -> dict:
         """Run one grounding query. Returns {"answer": str, "history": ..., "stats": ...}."""
         if isinstance(image, str):
@@ -277,6 +278,7 @@ class LocateAnythingWorker:
                 top_p=0.9 if temperature > 0 else None,
                 repetition_penalty=1.1,
                 verbose=verbose,
+                stop_after_first_box=stop_after_first_box,
             )
 
         t0 = time.time()
@@ -363,11 +365,20 @@ class LocateAnythingWorker:
         return self.ground(image, phrase, output_type="point", **kwargs)
 
     def ground(self, image: ImageLike, phrase: str, output_type: str = "point", **kwargs) -> GroundingResult:
-        """GUI grounding: 'point' -> <box><x><y></box>, 'box' -> 4-coord box."""
+        """GUI grounding: 'point' -> <box><x><y></box>, 'box' -> 4-coord box.
+
+        A single-object answer is one box, so the decode is capped at 64
+        tokens and stops at the first complete box: the model otherwise
+        rams on with duplicate boxes up to the cap (measured: 512 tokens /
+        ~60 s of pure spam on the 1070; the answer was the first 4 tokens).
+        ``detect`` (multi-box) is not affected.
+        """
         if output_type == "point":
             prompt = f"Point to: {phrase}."
         else:
             prompt = f"Locate the region that matches the following description: {phrase}."
+        kwargs.setdefault("stop_after_first_box", True)
+        kwargs.setdefault("max_new_tokens", 64)
         res = self.predict(image, prompt, **kwargs)
         img = image if isinstance(image, Image.Image) else Image.open(image)
         w, h = img.size
