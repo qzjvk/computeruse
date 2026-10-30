@@ -68,8 +68,21 @@ see, so the agent manages its capture:
   whole zoom runs again once on failure (decodes vary between runs). If
   the container still can't be boxed (point prompt fallback
   first, then the normal path), zoom is skipped and the normal strategy
-  runs. Measured: "terminal icon in the panel" 45 s, "plus button in the
-  tab bar" 55 s, both within a few px of the real target.
+  runs. A whole-frame box is the opposite failure: the container *is*
+  the whole capture (the browser being the focused window), so it is
+  accepted and the crop is the whole capture — one less retry.
+  Measured: "address bar in the browser" 1 m 25 s end-to-end (two model
+  passes + the 12 s page-load wait), "terminal icon in the panel"
+  1 m 15 s, both within a few px of the real target.
+* **Decode stops at the first box** — single-object grounding (point and
+  box prompts) stops the moment the first complete box is emitted and
+  caps the decode at 64 tokens: the model otherwise rams on with
+  duplicated boxes up to the cap (measured on the 1070: 512 tokens /
+  ~60 s of pure spam where the answer was the first 4 tokens; the
+  model-side early-stop flag lives in the git-ignored `locatenv` model
+  code and is a no-op for multi-box `detect` prompts). This is why a
+  pass now costs its prefill (~35-40 s on the 1070) instead of
+  prefill + up to a minute of decode spam.
 * **VRAM adapts at load and at run time** — after the model loads, the
   vision-token budget is fit to the free VRAM (prefill needs ~160 MiB per
   1024 vision tokens; the budget steps down/up so a shared card never
