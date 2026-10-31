@@ -263,6 +263,77 @@ Notes:
   taken on this host; change `docker-compose.yml` and `entrypoint.sh` if
   you move them.
 
+### Orchestrated runs (`orchestrate`): a small LLM plans, the controller executes
+
+For goals the scripted task language cannot express, a small local LLM
+plans: **LiquidAI LFM3-1.7B** (Q4_K_M GGUF, served by llama.cpp's
+OpenAI-compatible `llama-server`) on the same GTX 1070, ~1.4 GB
+footprint. The LLM sees only **text** — the goal, and the reported
+result of each executed step (ok/fail, elapsed, frame-change %, active
+window title) — and each turn emits exactly ONE tool call from a closed
+vocabulary (the controller verbs plus `observe`/`verify`/`done`). The
+deterministic executor in `controller.py` is the only actor that touches
+the screen; grounding stays inside it. The LLM is never asked "what do
+you see" (LocateAnything is a grounding model, not VQA), so perception
+is the deterministic window-title + 320×180 frame-diff signal.
+
+The planner is 1.7B, so the architecture compensates for measured
+weaknesses:
+
+- **Goal decomposition + an external progress tracker.** The goal is
+  split once into 2–6 subgoals; every planning prompt re-lists them with
+  `[DONE]`/`[NEXT]`/`[ ]` marks that advance only on *measured* state
+  (DDG title, non-DDG title, terminal title, type/key run in the
+  terminal). The model loses multi-part goals mid-run, so progress is
+  tracked outside it.
+- **Suggestion protocol.** After a measured state signature (results
+  page up, page settled, terminal focused), the deterministic layer
+  proposes a concrete next machine step, selected from the goal's own
+  words (scroll count, "terminal", the quoted command):
+  `search → click first result → wait-load → scroll N → open terminal →
+  type <command verbatim> → enter → done`. The planner may override with
+  evidence; **after two deviations from the same pending suggestion the
+  system executes the suggestion itself** — canonical transitions are
+  controller-verified, so following them is always safe. A follow resets
+  the count; `done` is a planner decision and is never overridden. A
+  pending step that the repeat guard would block (already run in this
+  state) is dropped instead of anchoring the planner on a step that
+  cannot run.
+- **Caps:** 32 steps, 180 s, 3 consecutive failures (blocked repeats
+  count).
+
+The server is spawned at orchestrate start and stopped at the end — the
+card is shared with the LocateAnything worker, whose model reload peaks
+at ~6.8 GB fp16 and fits the 8 GB card only with headroom for LFM3's
+1.25 GiB; `entrypoint.sh` also kills stray llama-servers before each
+worker load, and the planner re-ensures the server if it dies mid-run.
+`LFM3_PERSIST=1` keeps it warm between runs. The 1.05 GB GGUF is
+expected at `LFM3_MODEL` (downloaded at runtime, never committed).
+
+```bash
+# in the sandbox (the worker serves the "orchestrate" kind too):
+docker exec cuasandbox bash -lc \
+  'CUA_WAIT_SERVER=60 python -m computer_use --save-dir /tmp/orch_runs_real \
+   --task-file /tmp/goal.txt orchestrate'
+```
+
+Knobs: `LFM3_URL`/`LFM3_PORT` (attach to an existing server),
+`LFM3_MODEL`, `LFM3_BIN`, `LFM3_GPU` (default: the device named *1070*),
+`LFM3_PERSIST`, `LFM3_CTX` (4096), `LFM3_MAX_TOKENS` (256),
+`LFM3_TEMPERATURE` (0.1), `LFM3_TOP_K` (50); `CUA_WAIT_SERVER=<s>` makes
+the client wait for the worker socket. Sampling: temp 0.1, top-k 50,
+thinking disabled, `tool_choice: required`.
+
+Measured on the 1070: the 9-step goal (search → open first result →
+scroll 3 → open terminal → type a verbatim `echo … > /root/note.txt` →
+Enter) completed in **3/3 clean runs: 15 planning steps, 38–39 s loop**
+(~67 s cold including the LFM3 spawn), with the exact file content +
+fresh mtime and the article still in the tab. Planning calls run ~1–2 s;
+the slow-navigation quirk (the first click's post-capture still shows
+the search page; a second click or the wait-load finishes it) costs ~8 s.
+The scripted path for the same goal is still the fast lane at
+11.5–12.1 s — orchestration is for goals that cannot be scripted.
+
 ### Task language
 
 Steps are separated by `;` or newlines. A bare phrase is treated as `click`.

@@ -112,6 +112,25 @@ class _Handler(socketserver.StreamRequestHandler):
                         output_type=req.get("output_type", "point"),
                     )
                     ok = res.center is not None
+                elif req.get("kind") == "orchestrate":
+                    # LLM planning over the same worker: the planner
+                    # (LFM3, its own GPU share) picks the next step;
+                    # this worker does all the pixel-level work.
+                    from .orchestrator import OrchestratedAgent, Planner
+
+                    planner = Planner()
+                    planner.ensure_server()
+                    ok = OrchestratedAgent(
+                        self.server.worker, planner,
+                        dry_run=bool(req.get("dry_run", False)),
+                        delay=float(req.get("delay", 0.8)),
+                        scope=req.get("scope") or self.server.scope,
+                        monitor=req.get("monitor"),
+                        save_dir=req.get("save_dir") or None,
+                        max_steps=int(req.get("max_steps", 32)),
+                        max_seconds=float(req.get("max_seconds", 180.0)),
+                        box_fallback=bool(req.get("box_fallback", True)),
+                    ).run(req["goal"])
                 else:
                     from .controller import Agent
 
@@ -142,6 +161,8 @@ class _Handler(socketserver.StreamRequestHandler):
         try:
             if "task" in req:
                 label = f"task={req['task']!r}"
+            elif req.get("kind") == "orchestrate":
+                label = f"orchestrate goal={req.get('goal', '')!r}"
             elif "kind" in req:
                 label = f"offline query={req.get('query', '')!r}"
             else:
@@ -207,3 +228,19 @@ def send_task(req: dict, timeout: float = 1800.0) -> dict | None:
         return {"ok": False, "error": f"socket error: {e}", "log": ""}
     finally:
         s.close()
+
+
+def send_task_wait(req: dict, wait: float = 0.0,
+                   timeout: float = 1800.0) -> dict | None:
+    """send_task, but while the worker is mid-restart the socket is
+    briefly missing: wait for it instead of giving up (or, without the
+    wait budget, loading a second model copy on the same GPU and OOMing
+    the card)."""
+    deadline = time.time() + max(0.0, wait)
+    while True:
+        resp = send_task(req, timeout=timeout)
+        if resp is not None or time.time() >= deadline:
+            return resp
+        print("[client] worker not ready yet (restarting?); waiting...",
+              flush=True)
+        time.sleep(2)

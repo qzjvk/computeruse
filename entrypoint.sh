@@ -76,6 +76,13 @@ cd /app
 # the VNC session or the browser. Code changes need no image rebuild —
 # the container mounts the host's computer_use/ live.
 while true; do
+    # Kill any stray LFM3 planner server before (re)loading the worker:
+    # the worker's fp16 load peak (~6.8 GB) plus the LFM3 server
+    # (~1.25 GiB) does NOT fit the shared 8 GB 1070 (measured OOM,
+    # 2026-10-31). The planner server is (re)started on demand by
+    # orchestrate runs; a mid-run planner self-heals by re-ensuring,
+    # so killing one here is always safe.
+    pkill -f "llama-serve[r]" 2>/dev/null || true
     # --quant nf4 by default: the 1070 is SHARED with the host's own
     # desktop (X server, compositor, browser run on it). fp16 holds
     # ~6.6 GB of the 8 GB card and leaves ~1.1 GB free; a model-reload

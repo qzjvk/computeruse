@@ -13,6 +13,10 @@ Examples:
     # Resident worker: load the model once, then every run skips the ~25 s load
     python -m computer_use serve --scope window
     python -m computer_use "click File; click New"   # auto-connects when up
+
+    # LLM-orchestrated: a goal instead of a step script (LFM3 planner,
+    # see computer_use/orchestrator.py); the resident worker must be up
+    python -m computer_use orchestrate "search nvidia container cuda and open the first result"
 """
 
 from __future__ import annotations
@@ -85,6 +89,59 @@ def main(argv: list[str] | None = None) -> int:
         server.WorkerServer(args).serve_forever()
         return 0
 
+    # LLM-orchestrated mode: a goal instead of a step script. The planner
+    # (LFM3, LFM3_* env) picks the next step in the controller vocabulary;
+    # the resident worker does the pixel-level work (see orchestrator.py).
+    if args.task and args.task[0] == "orchestrate":
+        if args.task_file:
+            goal = open(args.task_file).read().strip()
+        elif len(args.task) > 1:
+            goal = " ".join(args.task[1:])
+        else:
+            print('orchestrate needs a goal, e.g.:\n'
+                  '  python -m computer_use orchestrate "open a terminal"')
+            return 2
+        req = {
+            "kind": "orchestrate", "goal": goal,
+            "scope": args.scope,
+            "dry_run": args.dry_run, "delay": args.delay,
+            "max_steps": args.max_steps, "monitor": args.monitor,
+            "save_dir": args.save_dir or None,
+            "box_fallback": not args.no_box_fallback,
+        }
+        if not args.no_server:
+            from . import server
+
+            wait = max(0, int(os.environ.get("CUA_WAIT_SERVER", "0") or 0))
+            resp = server.send_task_wait(req, wait=wait)
+            if resp is None:
+                print("[client] no resident worker on the socket and "
+                      "--no-server not set; start one with:\n"
+                      '  python -m computer_use serve --scope window')
+                return 1
+            print(resp.get("log", ""), end="")
+            if "error" in resp:
+                print(resp["error"])
+                if resp.get("traceback"):
+                    print(resp["traceback"])
+                return 1
+            return 0 if resp["ok"] else 1
+
+        from . import server
+        from .orchestrator import OrchestratedAgent, Planner
+
+        worker, scope = server.build_worker(args)
+        planner = Planner()
+        planner.ensure_server()
+        ok = OrchestratedAgent(
+            worker, planner, dry_run=args.dry_run, delay=args.delay,
+            scope=scope, monitor=args.monitor,
+            save_dir=args.save_dir or None,
+            max_steps=args.max_steps,
+            box_fallback=not args.no_box_fallback,
+        ).run(goal)
+        return 0 if ok else 1
+
     task = None
     if args.task_file:
         task = open(args.task_file).read()
@@ -138,15 +195,7 @@ def main(argv: list[str] | None = None) -> int:
             "save_dir": args.save_dir or None,
             "box_fallback": not args.no_box_fallback,
         }
-        resp = None
-        deadline = time.time() + wait
-        while True:
-            resp = server.send_task(req)
-            if resp is not None or time.time() >= deadline:
-                break
-            print("[client] worker not ready yet (restarting?); waiting...",
-                  flush=True)
-            time.sleep(2)
+        resp = server.send_task_wait(req, wait=wait)
         if resp is not None:
             print(resp.get("log", ""), end="")
             if "error" in resp:
