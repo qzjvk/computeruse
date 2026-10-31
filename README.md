@@ -267,6 +267,7 @@ Steps are separated by `;` or newlines. A bare phrase is treated as `click`.
 | `scroll <phrase> <n>` | scroll at the element (+up / −down)      |
 | `wait <seconds>`      | idle                                     |
 | `open <app>`          | tool step: launch/focus an app directly — `firefox`, `file manager`, `applications`. No grounding pass; the step returns only once the app's window has the focus, so a following `type`/`key` lands in it. Unknown apps fail loudly. |
+| `search <query>`      | tool step: open Firefox on a DuckDuckGo search for `<query>` (alias `duckduckgo <query>`). The URL goes straight to the browser binary (new tab in the running session, first tab of a fresh launch) — no address-bar typing, no focus race; the step waits for Firefox to hold the focus, then 3 s for the page load. |
 | `done`                | stop                                     |
 
 The `open` tools exist because app launching is exactly where icon grounding

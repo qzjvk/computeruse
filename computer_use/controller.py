@@ -12,6 +12,8 @@ language so the agent is transparent and easy to test:
     wait <seconds>            idle
     open <app>                tool step: launch/focus an app directly —
                               firefox | file manager | applications
+    search <query>            tool step: open Firefox on a DuckDuckGo
+                              search for <query> (alias: duckduckgo <query>)
     done                      stop
 
 Steps are separated by ';' or newlines. A bare phrase is treated as `click`.
@@ -22,6 +24,7 @@ from __future__ import annotations
 import re
 import subprocess
 import time
+from urllib.parse import quote_plus
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
@@ -35,7 +38,7 @@ ImageLike = Union[str, None]
 _VERB_RE = re.compile(
     r"^\s*(?P<verb>"
     r"click|left[- ]?click|double[- ]?click|right[- ]?click|"
-    r"type|key|scroll|wait|open|done"
+    r"type|key|scroll|wait|open|search|duckduckgo|done"
     r")\s*(?P<arg>.*?)\s*$",
     re.IGNORECASE,
 )
@@ -258,6 +261,8 @@ class Agent:
             return True
         if step.verb == "open":
             return self._open(step.arg, i)
+        if step.verb in ("search", "duckduckgo"):
+            return self._search(step.arg, i)
 
         # All remaining verbs need a grounded target.
         if step.verb == "scroll":
@@ -352,6 +357,39 @@ class Agent:
               f"[{cap.image.width}x{cap.image.height}]")
         actions.click(ax, ay, dry_run=False)
         actions.pause(0.5)  # let the menu popup open before the next step
+        return True
+
+    def _search(self, query: str, i: int) -> bool:
+        """`search <query>`: open Firefox and search DuckDuckGo for it.
+
+        Flow: launch (or attach to the running session, which opens a new
+        tab in its last-focused window and focuses it) -> wait for a
+        firefox window to hold the focus -> Ctrl+L -> type the URL ->
+        Return. Ctrl+L is the universal "focus the address bar" shortcut,
+        so this works in any tab and any session state. The URL argument
+        to the browser binary was measured unreliable here: a fresh
+        session that takes over a stale profile shows New Tab and drops
+        the URL, so the keystroke path is the only one that is
+        deterministic across all states. The URL is quote_plus-encoded
+        (space -> +), so every character xdotool types is plain ASCII.
+        """
+        url = "https://duckduckgo.com/?q=" + quote_plus(query)
+        if self.dry_run:
+            print(f"    [action (dry-run)] search {query!r} -> {url}")
+            return True
+        before = _visible_window_ids()
+        if actions.launch("firefox --no-sandbox") is None:
+            print("    [search] firefox binary not found")
+            return False
+        print(f"    [action] search {query!r}; waiting for firefox to take focus")
+        if not self._wait_app_focus(("firefox", "navigator"), before, timeout=15.0):
+            print("    [search] firefox window did not take focus within 15 s")
+            return False
+        actions.pause(0.5)  # let the window settle before the shortcut
+        _xdotool("key", "ctrl+l")
+        _xdotool("type", "--clearmodifiers", "--delay", "20", url)
+        _xdotool("key", "Return")
+        actions.pause(3.0)  # page load
         return True
 
     # -------------------------------------------------------------- ground
