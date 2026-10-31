@@ -274,11 +274,11 @@ Steps are separated by `;` or newlines. A bare phrase is treated as `click`.
 | `right-click <phrase>`| right-click                              |
 | `type <text>`         | type ASCII text                          |
 | `key <combo>`         | key combo, e.g. `ctrl+alt+t`, `enter`    |
-| `scroll <phrase> <n>` | scroll at the element (+up / −down)      |
+| `scroll <phrase> <n>` | scroll at the element (positive = down, − = up). The target is grounded on a coarse pass (≤ 320 vision patches): a scroll target is a large region — the point only has to land inside it — so region-level accuracy at ~1/10 of a full-window pass |
 | `wait <seconds>`      | idle                                     |
 | `open <app>`          | tool step: launch/focus an app directly — `firefox`, `file manager`, `terminal`, `applications`. No grounding pass; the step returns only once the app's window has the focus, so a following `type`/`key` lands in it. Unknown apps fail loudly. |
 | `search <query>`      | tool step: open Firefox on a DuckDuckGo search for `<query>` (alias `duckduckgo <query>`). The results page is shown — the top result is *not* resolved server-side (that would pick the answer without the agent ever seeing the results); a following `click the first result in the search results` grounds and opens it. Flow: wait for the new Firefox window to take focus → Ctrl+L → type → Return → poll the window title until the results document loads, then poll until the results region has rendered (no fixed pauses). |
-| `wait-load`           | wait until the active window's title changes (a navigation produced a new page). A measured load wait — no fixed guess; capped at 8 s. |
+| `wait-load`           | wait until a navigation's new page is painted. Two measured gates, no fixed guess: (1) the active window's title changes (50 ms poll, 8 s cap — a navigation leaves the old title up until the new document sets its own); (2) the screen settles on the new page (100 ms frame compares, 3 s cap) — the title is set *before* the paint (measured), so gate 1 alone would let the next step act on the old page |
 | `done`                | stop                                     |
 
 The `open` tools exist because app launching is exactly where icon grounding
@@ -287,21 +287,22 @@ lands on the directory-menu icon — a semantic bias that upscaling the strip
 does not fix) and because each saves a model pass. Everything else still
 goes through the VL grounding above.
 
-**Measured: a real research task in under 10 s.** The task "search a topic,
+**Measured: a real research task in ~9 s.** The task "search a topic,
 open the top result, dismiss the cookie wall, read the answer" runs in
-**9.05 s** on the 1070 (fresh sandbox container, wall clock, the task's
-own waits included; two runs: 8.21 s / 9.05 s — the 8.21 s run predates
-the render wait in `search`). The search is honest: the tool opens the
-DuckDuckGo **results page** (the top result is not resolved
-server-side), and the agent grounds and clicks the top result itself.
-The budget, per step:
+**8.2–10.5 s** on the 1070 (fresh sandbox container, wall clock, the task's
+own waits included; the spread is DDG/article load variance — e.g. the
+article title being set 0.8 s vs 1.2 s after the click. The two-gate
+`wait-load` adds a measured 0.02–0.25 s over the title-only wait). The
+search is honest: the tool opens the DuckDuckGo **results page** (the top
+result is not resolved server-side), and the agent grounds and clicks the
+top result itself. The budget, per step:
 
 | Step | Cost | Why |
 |---|---|---|
 | `search <query>` | ~1.5–2.4 s | no model pass — launch Firefox (the running session opens a new window), wait for that new window to take focus (`new_only`: typing before it exists loses keystrokes — measured), Ctrl+L → type → Return, poll the window title until the results document loads, then poll until the results region actually renders (measured: on DDG the title is set *before* the paint; the render lag varied 0.44 s to >1.1 s across runs) |
 | `wait 0.4` | 0.4 s | the task's own settle margin |
 | `click the first result in the search results` | ~2.8 s | the results-band prior crops the fixed band where the first organic result sits (left column below the search header; (0,384)–(768,496) of a 1280×620 window ≈ 432 patches) — one pass, no box pass. The model's box is trusted (everything in the band is part of the first result) and box-grounding is tried before point-grounding (a point wanders into the whitespace around the text; measured) |
-| `wait-load` | ~0.5 s | polls the window title every 50 ms until the navigation sets a new one |
+| `wait-load` | ~0.6–1.2 s | gate 1: poll the window title every 50 ms until the navigation sets a new one; gate 2: wait for the new page's paint to settle (100 ms frame compares) — measured overhead of gate 2: 0.02–0.25 s |
 | `wait 0.9` | 0.9 s | the OneTrust wall renders ~0.93 s after the title change (measured on a fresh profile: the dialog appears in a single frame) |
 | `click … in the dialog` | ~2.2 s | the center-region prior crops a fixed box around the button zone of a centered modal ((448,240)–(896,410) ≈ 384 patches) — one pass, no box pass |
 
@@ -312,6 +313,42 @@ window pass), and the cookie wall was grounded on the whole browser window
 resolving the top result server-side from DuckDuckGo's JS-free `/html/`
 endpoint — but that step picked the answer without the agent ever looking
 at the results, so it was removed.
+
+**Measured: a complex multi-app task in ~12 s.** The 9-step task "search a
+topic, open the top result, scroll the article, open a terminal, write a note
+file, press enter" spans two applications and runs in **11.5–12.1 s** on the
+1070 (four fresh-container runs; wall clock, the task's own waits included).
+No task-specific shortcuts: every step is grounded from pixels. The budget of
+the 12.1 s run:
+
+| Step | Cost | Why |
+|---|---|---|
+| `search <query>` | 1.64 s | no model pass — launch Firefox, wait for the new window's focus, type the query, wait for the results to render |
+| `wait 0.4` | 0.40 s | the task's own settle margin |
+| `click the first result in the search results` | 2.60 s | the results-band prior — one pass |
+| `wait-load` | 1.20 s | the title changed 1.18 s after the click (cold caches on a fresh container); the settle gate adds 0.02 s |
+| `scroll the article 3` | 4.16 s | coarse grounding pass: the capture is downsampled to 300 vision patches (≤ 320) — a scroll target is a large region; the point only has to land inside it. ~30 s cheaper than the 4004-patch full-window pass; the full-res capture is still saved as evidence |
+| `open terminal` | 1.25 s | the `open` tool — no grounding pass; returns when the terminal window has the focus |
+| `type echo … > /root/note.txt` | 0.72 s | typed directly into the focused window |
+| `key enter` | 0.01 s | — |
+
+Verified on each run: `/root/note.txt` contains the echoed line, and the
+article actually scrolled — the article region differs by 37–44 % of its
+pixels between the pre-scroll and post-scroll captures, and the "Solution:"
+section is visible in the final screenshot. (Before the two fixes below the
+same region differed by 0.02 %: the scroll had silently been a no-op.) The
+pixel diffs exposed two bugs:
+
+1. **Scroll sign.** pyautogui takes positive amounts as *up*; the task
+   language "scroll 3" means down. With the old sign a scroll at the top of a
+   freshly loaded article did nothing to the screen. The controller now
+   passes the negated amount — `scroll <phrase> <n>` in task language is
+   positive = down.
+2. **Scrolling the stale page.** The original `wait-load` waited for the
+   title change only; on DDG the article title is set 0.44–1.1 s *before* the
+   new page paints, so a scroll right after hit the old results page. The
+   settle gate (gate 2 of `wait-load`) fixes this at a measured 0.02–0.25 s
+   overhead.
 
 ## GTX 1070 notes
 

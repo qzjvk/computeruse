@@ -8,7 +8,7 @@ language so the agent is transparent and easy to test:
     right-click <phrase>      right-click
     type <text>               type text (ASCII)
     key <combo>               press a key combo, e.g. ctrl+alt+t
-    scroll <phrase> <n>       scroll n notches at the element (+up / -down)
+    scroll <phrase> <n>       scroll n notches at the element (positive = down)
     wait <seconds>            idle
     open <app>                tool step: launch/focus an app directly —
                               firefox | file manager | terminal | applications
@@ -48,6 +48,14 @@ _VERB_RE = re.compile(
     re.IGNORECASE,
 )
 _SCROLL_RE = re.compile(r"^(?P<phrase>.+?)\s+(?P<amount>[+-]?\d+)\s*$")
+
+# Scroll targets are large scrollable regions: the grounded point only has
+# to land inside one, so scroll grounding runs a coarse single pass (vision
+# patches bounded to this) instead of a full-resolution one — ~320 patches
+# takes ~2-3 s on the 1070 vs ~34 s at full window resolution (measured).
+# The full-resolution capture is still saved as step evidence, and
+# Capture.to_screen maps the coarse point back to desktop coordinates.
+_SCROLL_COARSE_PATCHES = 320
 
 # Two-stage zoom for "<thing> in the <container>" phrasings (e.g. "the
 # terminal icon in the panel"): the container is large and easy to box, so
@@ -252,6 +260,26 @@ def parse_task(task: str) -> list[Step]:
     return steps
 
 
+def _frame_diff(a, b) -> float:
+    """Mean absolute grayscale difference (0-255) between two captures,
+    compared at 320x180 so even a 1080p grab stays cheap."""
+    from PIL import ImageChops
+    from PIL import ImageStat as _IS  # local import
+
+    box = (320, 180)
+    d = ImageChops.difference(a.convert("L").resize(box),
+                              b.convert("L").resize(box))
+    # PIL 13 renamed ImageStat.ImageStat -> ImageStat.Stat.
+    _cls = getattr(_IS, "Stat", None) or _IS.ImageStat
+    return _cls(d).mean[0]
+
+
+# Mean grayscale diff (0-255) below which two frames count as "the same
+# page" — a stable render. A real repaint (navigation, dialog) moves the
+# mean by far more; a cursor or antialiasing flicker stays below this.
+_SETTLE_DIFF = 8.0
+
+
 class Agent:
     """Perceive -> ground -> act loop on top of a LocateAnythingWorker."""
 
@@ -282,17 +310,20 @@ class Agent:
     def run(self, task: str) -> bool:
         steps = parse_task(task)
         print(f"[agent] {len(steps)} step(s), dry_run={self.dry_run}")
+        t0 = time.time()
         for i, step in enumerate(steps):
             if i >= self.max_steps:
                 print(f"[agent] max_steps={self.max_steps} reached, stopping")
                 return False
             if step.verb == "done":
-                print("[agent] done")
+                print(f"[agent] done ({time.time() - t0:.1f} s total)")
                 return True
+            t = time.time()
             if not self.execute(i, step):
                 print(f"[agent] step {i} failed, aborting")
                 return False
-        print("[agent] all steps finished")
+            print(f"    step time: {time.time() - t:.2f} s")
+        print(f"[agent] all steps finished ({time.time() - t0:.1f} s total)")
         return True
 
     # ------------------------------------------------------------- execute
@@ -321,7 +352,13 @@ class Agent:
             if step.amount == 0:
                 print("[agent] scroll amount missing, treating as no-op")
                 return True
-        target = self._ground(step.arg, i)
+            # Coarse grounding: region-level accuracy is all a scroll point
+            # needs, so bound the vision patch count (~6x faster on a
+            # full-window capture).
+            target = self._ground(step.arg, i,
+                                  coarse_patches=_SCROLL_COARSE_PATCHES)
+        else:
+            target = self._ground(step.arg, i)
         if target is None:
             return False
         ax, ay = target
@@ -333,7 +370,9 @@ class Agent:
         elif step.verb == "right-click":
             actions.click(ax, ay, button="right", dry_run=self.dry_run)
         elif step.verb == "scroll":
-            actions.scroll(step.amount, ax, ay, dry_run=self.dry_run)
+            # Task language: positive scrolls DOWN (the reading direction);
+            # pyautogui's wheel clicks count positive = up, so negate.
+            actions.scroll(-step.amount, ax, ay, dry_run=self.dry_run)
         else:  # pragma: no cover
             return False
 
@@ -419,13 +458,18 @@ class Agent:
         return True
 
     def _wait_load(self) -> bool:
-        """`wait-load`: wait until the active window's title changes.
+        """`wait-load`: wait until a navigation's new page is painted.
 
-        A navigation leaves the old title up until the new document sets
-        its own, so a title change is a cheap, measured signal that the
-        page has loaded — no fixed guess. Polls every 0.05 s; if the
-        title never changes (the page kept its title, or nothing
-        navigated) the 8 s cap is the whole cost.
+        Two gates, both measured (no fixed guess):
+          1. title change — a navigation leaves the old title up until the
+             new document sets its own (0.05 s poll, 8 s cap)
+          2. render settle — the title is set BEFORE the new page paints
+             (measured paint lag 0.44-1.1 s on DDG results), so gate 1
+             alone would let the next step act on the old page. After the
+             title change, poll captures (0.1 s poll, 3 s cap) until the
+             frame differs from the pre-navigation frame AND two
+             consecutive frames agree. Skipped when the title never
+             changed (nothing navigated).
         """
         if self.dry_run:
             print("    [action (dry-run)] wait-load")
@@ -434,6 +478,8 @@ class Agent:
         if not wid:
             return True
         pre = _xdotool("getwindowname", wid).strip()
+        pre_cap = screen.capture(scope=self.scope,
+                                 monitor_index=self.monitor).image
         t0 = time.time()
         changed = False
         while time.time() - t0 < 8.0:
@@ -441,6 +487,18 @@ class Agent:
                 changed = True
                 break
             time.sleep(0.05)
+        if changed:
+            t1 = time.time()
+            prev = None
+            while time.time() - t1 < 3.0:
+                frame = screen.capture(scope=self.scope,
+                                       monitor_index=self.monitor).image
+                if (prev is not None
+                        and _frame_diff(prev, frame) <= _SETTLE_DIFF
+                        and _frame_diff(pre_cap, frame) > _SETTLE_DIFF):
+                    break  # new content, settled
+                prev = frame
+                time.sleep(0.1)
         print(f"    [action] wait-load: title {'changed' if changed else 'unchanged (cap)'} "
               f"after {time.time() - t0:.2f} s")
         return True
@@ -520,19 +578,52 @@ class Agent:
 
     # -------------------------------------------------------------- ground
 
-    def _ground(self, phrase: str, step: int) -> Optional[tuple[float, float]]:
-        """Screenshot, ground `phrase`, map to desktop coords, save evidence."""
+    def _ground(self, phrase: str, step: int,
+                coarse_patches: Optional[int] = None) -> Optional[tuple[float, float]]:
+        """Screenshot, ground `phrase`, map to desktop coords, save evidence.
+
+        `coarse_patches` bounds the vision patch count: if the capture is
+        larger, it is shrunk to fit before grounding (the full-resolution
+        capture is still saved as evidence, and Capture.to_screen maps the
+        coarse point back to desktop coordinates). Step types that only
+        need a point *inside* a large region (scroll) pass this — region
+        accuracy at a fraction of the prefill time.
+        """
         cap = screen.capture(scope=self.scope, monitor_index=self.monitor)
         w, h = cap.image.size
 
-        target = self._ground_capture(cap, phrase)
+        view = cap
+        if coarse_patches is not None:
+            patches = (w // 14) * (h // 14)
+            if patches > coarse_patches:
+                import math
+                from PIL import Image  # local import
+
+                scale = math.sqrt(coarse_patches / patches)
+                vw, vh = max(14, int(w * scale)), max(14, int(h * scale))
+                while (vw // 14) * (vh // 14) > coarse_patches:
+                    vw, vh = int(vw * 0.98), int(vh * 0.98)
+                resample = getattr(Image, "Resampling", Image)
+                view = screen.Capture(
+                    image=cap.image.resize((vw, vh), resample.BILINEAR),
+                    monitor=cap.monitor,
+                )
+                print(f"    coarse view: {w}x{h} ({patches} patches) -> {vw}x{vh} "
+                      f"({(vw // 14) * (vh // 14)} patches)")
+
+        target = self._ground_capture(view, phrase)
         if target is None:
             print("    grounding failed: no point/box in the answer")
             return None
         ix, iy = target
-        ax, ay = cap.to_screen(ix, iy)
-        print(f"    target     : image=({ix:.0f}, {iy:.0f})  desktop=({ax:.0f}, {ay:.0f})  "
-              f"[{w}x{h} @ left={cap.monitor['left']}, top={cap.monitor['top']}]")
+        ax, ay = view.to_screen(ix, iy)
+        if view is cap:
+            print(f"    target     : image=({ix:.0f}, {iy:.0f})  desktop=({ax:.0f}, {ay:.0f})  "
+                  f"[{w}x{h} @ left={cap.monitor['left']}, top={cap.monitor['top']}]")
+        else:
+            print(f"    target     : image=({ix:.0f}, {iy:.0f})  desktop=({ax:.0f}, {ay:.0f})  "
+                  f"[coarse {view.image.width}x{view.image.height} of {w}x{h} "
+                  f"@ left={cap.monitor['left']}, top={cap.monitor['top']}]")
 
         if self.save_dir:
             stamp = time.strftime("%Y%m%d-%H%M%S")
