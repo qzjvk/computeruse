@@ -12,8 +12,9 @@ language so the agent is transparent and easy to test:
     wait <seconds>            idle
     open <app>                tool step: launch/focus an app directly —
                               firefox | file manager | applications
-    search <query>            tool step: open Firefox on a DuckDuckGo
-                              search for <query> (alias: duckduckgo <query>)
+    search <query>            tool step: open Firefox on the top
+                              DuckDuckGo result for <query> (resolved
+                              server-side; alias: duckduckgo <query>)
     done                      stop
 
 Steps are separated by ';' or newlines. A bare phrase is treated as `click`.
@@ -24,7 +25,8 @@ from __future__ import annotations
 import re
 import subprocess
 import time
-from urllib.parse import quote_plus
+from html import unescape
+from urllib.parse import parse_qs, quote_plus, urlparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
@@ -59,7 +61,27 @@ _CONTAINERS = frozenset({
     "address bar", "status bar", "sidebar", "side bar", "taskbar", "task bar",
     "dock", "tray", "clock", "task switcher", "launcher", "window", "desktop",
     "screen", "browser", "menu", "bar", "ribbon", "footer", "header",
+    "dialog", "modal", "popup", "dialog box", "modal dialog",
+    "popup window", "cookie dialog",
 })
+
+# Containers that by definition float near the center of their window
+# (modal dialogs: cookie walls, confirmation popups). Their exact box is
+# unknown, but a fixed band around the capture center contains them
+# without the model's box pass — one fewer model pass per step, and the
+# crop is small enough for a fast pass. Measured on the cookie wall of
+# the NVIDIA support page: the dialog spanned window y≈139-444 of a
+# 1152x623 window (center 291 vs window center 311); a 280 px band
+# around the center contains it with ~30 px margin on each side while
+# cutting the crop from ~3600 to ~1640 patches (~16 s -> ~8.7 s prefill
+# on the 1070). If the target isn't in the band, the deterministic strip
+# fails and the normal two-pass zoom runs instead (same as the edge
+# strips).
+_CENTER_CONTAINERS = frozenset({
+    "dialog", "modal", "popup", "dialog box", "modal dialog",
+    "popup window", "cookie dialog",
+})
+_CENTER_STRIP_H = 280
 
 # Containers that live on a screen edge (XFCE: top menu panel, bottom
 # launcher panel, tray, clock). For these, a box touching the edge is
@@ -158,6 +180,51 @@ def _container_of(phrase: str) -> Optional[str]:
         return None
     noun = m.group(1).lower().strip()
     return noun if noun in _CONTAINERS else None
+
+
+def _ddg_top_result(query: str) -> Optional[str]:
+    """Resolve the top organic DuckDuckGo result for ``query`` server-side.
+
+    DuckDuckGo's ``/html/`` endpoint is server-rendered (no JS), so the
+    first organic result's URL can be extracted from the raw HTML — this
+    removes the model pass + click that used to open the first result
+    (~33 s on the 1070). The result link is a ``/l/`` redirect whose
+    ``uddg`` query parameter is the URL-encoded target. A browser-like
+    User-Agent is required: the endpoint serves an anomaly.js bot
+    challenge to python's default client fingerprint (measured), and
+    passes through a Chrome-like one (~1 s round trip). Returns None on
+    any failure (network down, endpoint layout changed, challenge) so
+    the caller can fall back to the results page, which the click flow
+    still handles.
+    """
+    import urllib.request
+    url = "https://duckduckgo.com/html/?q=" + quote_plus(query)
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/126.0.0.0 Safari/537.36")})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            html = r.read().decode("utf-8", "replace")
+    except Exception as e:
+        print(f"    [search] top-result fetch failed ({e}); "
+              "falling back to the results page")
+        return None
+    m = re.search(r'class="result__a"[^>]*href="([^"]+)"', html)
+    if not m:
+        print("    [search] no organic result in the /html/ endpoint; "
+              "falling back to the results page")
+        return None
+    href = unescape(m.group(1))
+    if href.startswith("//"):
+        href = "https:" + href
+    uddg = parse_qs(urlparse(href).query).get("uddg", [None])[0]
+    if not uddg:
+        print("    [search] result link has no uddg target; "
+              "falling back to the results page")
+        return None
+    print(f"    [search] top result: {uddg}")
+    return uddg
 
 
 @dataclass
@@ -360,36 +427,59 @@ class Agent:
         return True
 
     def _search(self, query: str, i: int) -> bool:
-        """`search <query>`: open Firefox and search DuckDuckGo for it.
+        """`search <query>`: open Firefox on the top DuckDuckGo result.
 
-        Flow: launch (or attach to the running session, which opens a new
-        tab in its last-focused window and focuses it) -> wait for a
-        firefox window to hold the focus -> Ctrl+L -> type the URL ->
-        Return. Ctrl+L is the universal "focus the address bar" shortcut,
-        so this works in any tab and any session state. The URL argument
-        to the browser binary was measured unreliable here: a fresh
-        session that takes over a stale profile shows New Tab and drops
-        the URL, so the keystroke path is the only one that is
-        deterministic across all states. The URL is quote_plus-encoded
-        (space -> +), so every character xdotool types is plain ASCII.
+        The top organic result is resolved on the server side from
+        DuckDuckGo's /html/ endpoint (server-rendered HTML, no JS) —
+        that removes the model pass + click that used to open the first
+        result (~33 s on the 1070). If the fetch or parse fails the step
+        falls back to the results page itself, which the click flow still
+        handles.
+
+        Flow: launch Firefox -> (while it starts) resolve the result URL
+        -> wait for the firefox window to hold the focus -> Ctrl+L ->
+        type the URL -> Return -> poll the window title until the page
+        loads (the title changes from 'New Tab' / 'Mozilla Firefox' to
+        the page title), instead of a fixed pause. Ctrl+L is the
+        universal "focus the address bar" shortcut, so this works in any
+        tab and any session state — the URL argument to the browser
+        binary was measured unreliable (a fresh session taking over a
+        stale profile drops it and shows New Tab). The URL is
+        quote_plus-encoded, so every character xdotool types is plain
+        ASCII.
         """
-        url = "https://duckduckgo.com/?q=" + quote_plus(query)
         if self.dry_run:
-            print(f"    [action (dry-run)] search {query!r} -> {url}")
+            print(f"    [action (dry-run)] search {query!r} "
+                  f"-> top DDG result or { 'https://duckduckgo.com/?q=' + quote_plus(query) }")
             return True
         before = _visible_window_ids()
         if actions.launch("firefox --no-sandbox") is None:
             print("    [search] firefox binary not found")
             return False
+        # The fetch overlaps Firefox's startup (the launch above is a
+        # non-blocking Popen).
+        url = _ddg_top_result(query)
+        if url is None:
+            url = "https://duckduckgo.com/?q=" + quote_plus(query)
         print(f"    [action] search {query!r}; waiting for firefox to take focus")
         if not self._wait_app_focus(("firefox", "navigator"), before, timeout=15.0):
             print("    [search] firefox window did not take focus within 15 s")
             return False
+        pre = _xdotool("getwindowname", _xdotool("getactivewindow")).strip()
         actions.pause(0.5)  # let the window settle before the shortcut
         _xdotool("key", "ctrl+l")
-        _xdotool("type", "--clearmodifiers", "--delay", "20", url)
+        _xdotool("type", "--clearmodifiers", "--delay", "10", url)
         _xdotool("key", "Return")
-        actions.pause(3.0)  # page load
+        # Measured load wait: the window title changes from "New Tab" /
+        # "Mozilla Firefox" to "<page title> - Mozilla Firefox" when the
+        # load starts, so poll it instead of a fixed pause.
+        t0 = time.time()
+        while time.time() - t0 < 8.0:
+            title = _xdotool("getwindowname", _xdotool("getactivewindow")).strip()
+            if title and title != pre and title not in ("New Tab", "Mozilla Firefox"):
+                break
+            time.sleep(0.25)
+        actions.pause(0.5)  # let the page settle (cookie walls pop up late)
         return True
 
     # -------------------------------------------------------------- ground
@@ -562,6 +652,8 @@ class Agent:
         Edge containers with a fixed desktop position (_EDGE_DEFAULT) skip
         the box pass entirely: the strip is the known edge of the screen,
         and only pass 2 (the target in the strip) costs a model pass.
+        Center containers (_CENTER_CONTAINERS: modal dialogs, cookie
+        walls) do the same with a fixed band around the capture center.
         """
         if container in _EDGE_DEFAULT:
             w, h = img.width, img.height
@@ -575,6 +667,17 @@ class Agent:
             if zt is not None:
                 return zt
             print("    zoom: deterministic strip failed; falling back "
+                  "to the box pass")
+        if container in _CENTER_CONTAINERS:
+            w, h = img.width, img.height
+            box = ((0.0, max(0.0, h / 2 - _CENTER_STRIP_H / 2),
+                    float(w), min(float(h), h / 2 + _CENTER_STRIP_H / 2)))
+            zt = self._zoom_attempt(
+                img, phrase, container, box=box,
+                box_note="known center region", det_edge="center")
+            if zt is not None:
+                return zt
+            print("    zoom: deterministic center strip failed; falling back "
                   "to the box pass")
         for attempt in (1, 2):
             zt = self._zoom_attempt(img, phrase, container)

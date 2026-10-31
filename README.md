@@ -63,6 +63,14 @@ see, so the agent manages its capture:
   For full-length containers (panel, taskbar, menu bar) the strip runs
   the whole screen edge, so a box covering only part of it cannot clip
   the target out of the crop.
+  Containers with a fixed position skip the box pass entirely: edge
+  containers (panel, taskbar, menu bar, …) use a deterministic strip at
+  the known screen edge, and center containers (modal dialogs, cookie
+  walls, popups) use a deterministic 280 px band around the capture
+  center — a cookie wall is a centered modal, so the band contains it
+  without the box pass and cuts the crop from ~3600 to ~1640 patches
+  (~16 s → ~8.7 s prefill on the 1070; if the target isn't in the band
+  the normal two-pass zoom runs instead).
   Tiny corner boxes — the model's failure mode for
   full-window containers — are rejected with one box retry, and the
   whole zoom runs again once on failure (decodes vary between runs). If
@@ -267,7 +275,7 @@ Steps are separated by `;` or newlines. A bare phrase is treated as `click`.
 | `scroll <phrase> <n>` | scroll at the element (+up / −down)      |
 | `wait <seconds>`      | idle                                     |
 | `open <app>`          | tool step: launch/focus an app directly — `firefox`, `file manager`, `applications`. No grounding pass; the step returns only once the app's window has the focus, so a following `type`/`key` lands in it. Unknown apps fail loudly. |
-| `search <query>`      | tool step: open Firefox on a DuckDuckGo search for `<query>` (alias `duckduckgo <query>`). The URL goes straight to the browser binary (new tab in the running session, first tab of a fresh launch) — no address-bar typing, no focus race; the step waits for Firefox to hold the focus, then 3 s for the page load. |
+| `search <query>`      | tool step: open Firefox on the **top** DuckDuckGo result for `<query>` (alias `duckduckgo <query>`). The result URL is resolved server-side from DuckDuckGo's JS-free `/html/` endpoint (first `result__a` link, `uddg=` target) — no model pass, no click on the results page. On fetch/parse failure it falls back to the results page. Then: wait for Firefox focus → Ctrl+L → type → Return → poll the window title until the page loads (no fixed pause). |
 | `done`                | stop                                     |
 
 The `open` tools exist because app launching is exactly where icon grounding
@@ -275,6 +283,23 @@ is weakest (measured: "file manager icon" in the panel deterministically
 lands on the directory-menu icon — a semantic bias that upscaling the strip
 does not fix) and because each saves a model pass. Everything else still
 goes through the VL grounding above.
+
+**Measured: a real research task in under 20 s.** The task "search a topic,
+open the top result, dismiss the cookie wall, read the answer" runs in
+**~16.5 s** on the 1070 (fresh sandbox container, wall clock, two runs
+16.78 s / 16.49 s; the task's own `wait 3` is included). The budget, per
+step:
+
+| Step | Cost | Why |
+|---|---|---|
+| `search <query>` | ~6 s | no model pass — the top result URL is resolved server-side from DuckDuckGo's JS-free `/html/` endpoint (~1 s), overlapped with Firefox's launch, then focus + Ctrl+L + type + Return + a window-title load poll |
+| `wait 3` | 3 s | the task's own settle (the cookie wall pops up late) |
+| `click … in the dialog` | ~7 s | the center-region prior crops a fixed 280 px band around the capture center (~1820 patches) — one fast pass, no box pass — and grounds the button inside it |
+
+Before these two changes the same task took ~81 s: the top result was
+opened by grounding a click on the DuckDuckGo results page (~33 s, a
+full window pass), and the cookie wall was grounded on the whole browser
+window (~39 s, another full pass).
 
 ## GTX 1070 notes
 
