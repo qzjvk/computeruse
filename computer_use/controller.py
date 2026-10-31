@@ -91,6 +91,12 @@ _EDGE_DEFAULT = {
 # vision patches -> a quadratically cheaper prefill (measured on the 1070:
 # 120 px -> 1096 patches -> 5.7 s prefill; 64 px -> 548 patches -> 2.9 s).
 _EDGE_STRIP_H = 64
+# A menu bar is a thin bar (~20-30 px on every desktop), so the top-edge
+# strip is shorter. A 64 px top strip drags in the window content just below
+# the bar, and the model then lands its vertical estimate in that content
+# (measured: "Applications" at y=43 of a 64 px strip — below the 27 px bar —
+# vs y=2-6 in a 48 px strip, on the button).
+_EDGE_STRIP_H_TOP = 48
 
 
 def _container_of(phrase: str) -> Optional[str]:
@@ -401,8 +407,9 @@ class Agent:
         if container in _EDGE_DEFAULT:
             w, h = img.width, img.height
             edge = _EDGE_DEFAULT[container]
-            box = ((0.0, float(h) - _EDGE_STRIP_H, float(w), float(h))
-                   if edge == "bottom" else (0.0, 0.0, float(w), _EDGE_STRIP_H))
+            strip_h = _EDGE_STRIP_H_TOP if edge == "top" else _EDGE_STRIP_H
+            box = ((0.0, float(h) - strip_h, float(w), float(h))
+                   if edge == "bottom" else (0.0, 0.0, float(w), strip_h))
             zt = self._zoom_attempt(
                 img, phrase, container, box=box,
                 box_note=f"known {edge} edge", det_edge=edge)
