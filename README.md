@@ -65,12 +65,14 @@ see, so the agent manages its capture:
   the target out of the crop.
   Containers with a fixed position skip the box pass entirely: edge
   containers (panel, taskbar, menu bar, …) use a deterministic strip at
-  the known screen edge, and center containers (modal dialogs, cookie
-  walls, popups) use a deterministic 280 px band around the capture
-  center — a cookie wall is a centered modal, so the band contains it
-  without the box pass and cuts the crop from ~3600 to ~1640 patches
-  (~16 s → ~8.7 s prefill on the 1070; if the target isn't in the band
-  the normal two-pass zoom runs instead).
+  the known screen edge, center containers (modal dialogs, cookie
+  walls, popups) use a deterministic box around the button zone slightly
+  below the capture center, and result lists (a search results page) use
+  a deterministic band where the first organic result sits (left column,
+  below the search header). All of them cut the crop to a few hundred
+  patches — one fast pass on the 1070 instead of a ~16 s full-window
+  pass; if the target isn't in the box the normal two-pass zoom runs
+  instead.
   Tiny corner boxes — the model's failure mode for
   full-window containers — are rejected with one box retry, and the
   whole zoom runs again once on failure (decodes vary between runs). If
@@ -275,7 +277,8 @@ Steps are separated by `;` or newlines. A bare phrase is treated as `click`.
 | `scroll <phrase> <n>` | scroll at the element (+up / −down)      |
 | `wait <seconds>`      | idle                                     |
 | `open <app>`          | tool step: launch/focus an app directly — `firefox`, `file manager`, `applications`. No grounding pass; the step returns only once the app's window has the focus, so a following `type`/`key` lands in it. Unknown apps fail loudly. |
-| `search <query>`      | tool step: open Firefox on the **top** DuckDuckGo result for `<query>` (alias `duckduckgo <query>`). The result URL is resolved server-side from DuckDuckGo's JS-free `/html/` endpoint (first `result__a` link, `uddg=` target) — no model pass, no click on the results page. On fetch/parse failure it falls back to the results page. Then: wait for Firefox focus → Ctrl+L → type → Return → poll the window title until the page loads (no fixed pause). |
+| `search <query>`      | tool step: open Firefox on a DuckDuckGo search for `<query>` (alias `duckduckgo <query>`). The results page is shown — the top result is *not* resolved server-side (that would pick the answer without the agent ever seeing the results); a following `click the first result in the search results` grounds and opens it. Flow: wait for the new Firefox window to take focus → Ctrl+L → type → Return → poll the window title until the results document loads, then poll until the results region has rendered (no fixed pauses). |
+| `wait-load`           | wait until the active window's title changes (a navigation produced a new page). A measured load wait — no fixed guess; capped at 8 s. |
 | `done`                | stop                                     |
 
 The `open` tools exist because app launching is exactly where icon grounding
@@ -284,26 +287,35 @@ lands on the directory-menu icon — a semantic bias that upscaling the strip
 does not fix) and because each saves a model pass. Everything else still
 goes through the VL grounding above.
 
-**Measured: a real research task in under 20 s.** The task "search a topic,
+**Measured: a real research task in under 10 s.** The task "search a topic,
 open the top result, dismiss the cookie wall, read the answer" runs in
-**~16.5 s** on the 1070 (fresh sandbox container, wall clock, two runs
-16.78 s / 16.49 s; the task's own `wait 3` is included). The budget, per
-step:
+**9.05 s** on the 1070 (fresh sandbox container, wall clock, the task's
+own waits included; two runs: 8.21 s / 9.05 s — the 8.21 s run predates
+the render wait in `search`). The search is honest: the tool opens the
+DuckDuckGo **results page** (the top result is not resolved
+server-side), and the agent grounds and clicks the top result itself.
+The budget, per step:
 
 | Step | Cost | Why |
 |---|---|---|
-| `search <query>` | ~6 s | no model pass — the top result URL is resolved server-side from DuckDuckGo's JS-free `/html/` endpoint (~1 s), overlapped with Firefox's launch, then focus + Ctrl+L + type + Return + a window-title load poll |
-| `wait 3` | 3 s | the task's own settle (the cookie wall pops up late) |
-| `click … in the dialog` | ~7 s | the center-region prior crops a fixed 280 px band around the capture center (~1820 patches) — one fast pass, no box pass — and grounds the button inside it |
+| `search <query>` | ~1.5–2.4 s | no model pass — launch Firefox (the running session opens a new window), wait for that new window to take focus (`new_only`: typing before it exists loses keystrokes — measured), Ctrl+L → type → Return, poll the window title until the results document loads, then poll until the results region actually renders (measured: on DDG the title is set *before* the paint; the render lag varied 0.44 s to >1.1 s across runs) |
+| `wait 0.4` | 0.4 s | the task's own settle margin |
+| `click the first result in the search results` | ~2.8 s | the results-band prior crops the fixed band where the first organic result sits (left column below the search header; (0,384)–(768,496) of a 1280×620 window ≈ 432 patches) — one pass, no box pass. The model's box is trusted (everything in the band is part of the first result) and box-grounding is tried before point-grounding (a point wanders into the whitespace around the text; measured) |
+| `wait-load` | ~0.5 s | polls the window title every 50 ms until the navigation sets a new one |
+| `wait 0.9` | 0.9 s | the OneTrust wall renders ~0.93 s after the title change (measured on a fresh profile: the dialog appears in a single frame) |
+| `click … in the dialog` | ~2.2 s | the center-region prior crops a fixed box around the button zone of a centered modal ((448,240)–(896,410) ≈ 384 patches) — one pass, no box pass |
 
-Before these two changes the same task took ~81 s: the top result was
-opened by grounding a click on the DuckDuckGo results page (~33 s, a
-full window pass), and the cookie wall was grounded on the whole browser
-window (~39 s, another full pass).
+Before these layout priors the same task took ~81 s: the top result was
+opened by grounding a click on the DuckDuckGo results page (~33 s, a full
+window pass), and the cookie wall was grounded on the whole browser window
+(~39 s, another full pass). An intermediate design got it to ~16.5 s by
+resolving the top result server-side from DuckDuckGo's JS-free `/html/`
+endpoint — but that step picked the answer without the agent ever looking
+at the results, so it was removed.
 
 ## GTX 1070 notes
 
-The 1070 is a Pascal GPU (compute capability 6.1, 8 GB). Four constraints
+The 1070 is a Pascal GPU (compute capability 6.1, 8 GB). Five constraints
 shape this repo:
 
 1. **torch ≤ 2.5.1** — PyTorch 2.6+ dropped sm_61 kernels entirely (the build
@@ -319,6 +331,15 @@ shape this repo:
    leaves only ~1 GB for activations on an 8 GB card, and the prefill logits
    copy is the biggest one. The 0.4B vision encoder therefore runs on the CPU
    (one extra second per query) via `--vit-cpu auto` (default).
+5. **NF4 weights on a shared card** — the sandbox worker defaults to
+   `--quant nf4` (≈ 3.3 GB) instead of fp16 (≈ 6.6 GB). In this setup the
+   1070 is *also* the host's display GPU (X server, compositor and browser
+   run on it): fp16 left only ~1.1 GB for the desktop, and a model-reload
+   VRAM spike in that headroom wedged the driver and froze the host until a
+   reboot (measured incident, 2026-10-31). NF4 leaves ~4.4 GB for the
+   desktop, and reloads are no longer a freeze risk. Speed is unchanged on
+   the 1070 (measured: prefill is attention/compute-bound, not
+   weight-stream-bound).
 
 VRAM budget (8 GB card, full-HD screenshot):
 

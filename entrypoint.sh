@@ -76,11 +76,16 @@ cd /app
 # the VNC session or the browser. Code changes need no image rebuild —
 # the container mounts the host's computer_use/ live.
 while true; do
-    # Note: no --quant nf4 here. Measured on the 1070: the 4-bit dequant kernel
-# does not beat fp16 (prefill is attention/compute-bound, not weight-stream
-# bound), and for small crops the 4-bit weight stream is actually slower.
-# --quant nf4 is available for VRAM headroom (7 GB -> 3.5 GB).
-python -m computer_use serve --model /locatenv --scope window ${GPU1070:+--gpu "$GPU1070"} || rc=$?
+    # --quant nf4 by default: the 1070 is SHARED with the host's own
+    # desktop (X server, compositor, browser run on it). fp16 holds
+    # ~6.6 GB of the 8 GB card and leaves ~1.1 GB free; a model-reload
+    # VRAM spike in that headroom wedged the driver and froze the host
+    # machine until a reboot (measured incident, 2026-10-31). NF4 holds
+    # ~3.5 GB and leaves ~4 GB for the desktop. Speed is unchanged on
+    # the 1070 (measured: the 4-bit dequant kernel does not beat fp16 —
+    # prefill is attention/compute-bound, and for small crops the 4-bit
+    # weight stream is actually slower), so nothing is lost.
+    python -m computer_use serve --model /locatenv --scope window --quant nf4 ${GPU1070:+--gpu "$GPU1070"} || rc=$?
     echo "[sandbox] worker exited (code ${rc:-0}); restarting in 5 s"
     sleep 5
 done

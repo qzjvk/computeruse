@@ -57,12 +57,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="Ground and log actions but do not move the mouse")
     p.add_argument("--scope", choices=["window", "screen"], default="window",
                    help="Capture scope: the active window (default, near-native resolution) or the full monitor")
-    p.add_argument("--delay", type=float, default=0.5,
-                   help="Pause after each grounded action (seconds); 0.5 lets "
-                        "a click settle AND gives a freshly spawned window "
-                        "(e.g. a launcher icon opening a terminal) time to "
-                        "appear and gain focus before the next action. A "
-                        "task's own 'wait N' covers longer loads.")
+    p.add_argument("--delay", type=float, default=0.2,
+                   help="Pause after each grounded action (seconds); "
+                        "0.2 lets a click settle. A task's own 'wait N' "
+                        "(or 'wait-load') covers longer loads.")
     p.add_argument("--max-steps", type=int, default=32)
     p.add_argument("--monitor", type=int, help="Monitor index for screenshots (default: mouse position)")
     p.add_argument("--save-dir", default="runs", help="Where to save step screenshots ('' to disable)")
