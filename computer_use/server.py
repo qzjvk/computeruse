@@ -23,6 +23,7 @@ import re
 import socket
 import socketserver
 import time
+import traceback
 
 SOCKET_PATH = os.environ.get("CUA_SOCKET", "/tmp/computeruse.sock")
 
@@ -130,7 +131,12 @@ class _Handler(socketserver.StreamRequestHandler):
                     ok = agent.run(req["task"])
             resp = {"ok": ok, "log": buf.getvalue()}
         except Exception as e:  # report back, keep the server alive
-            resp = {"ok": False, "error": repr(e), "log": buf.getvalue()}
+            tb = traceback.format_exc()
+            # Full traceback on the serve stdout (audit log) and in the
+            # client response — repr alone lost the failing line.
+            print(f"[serve] task failed:\n{tb}", flush=True)
+            resp = {"ok": False, "error": repr(e),
+                    "traceback": tb, "log": buf.getvalue()}
         # Task history on the serve process's stdout, so
         # `docker logs cuasandbox` doubles as a task audit log.
         try:

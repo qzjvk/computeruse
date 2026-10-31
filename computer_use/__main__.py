@@ -109,6 +109,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(resp.get("log", ""), end="")
                 if "error" in resp:
                     print(resp["error"])
+                    if resp.get("traceback"):
+                        print(resp["traceback"])
                     return 1
                 return 0 if resp["ok"] else 1
 
@@ -149,6 +151,8 @@ def main(argv: list[str] | None = None) -> int:
             print(resp.get("log", ""), end="")
             if "error" in resp:
                 print(resp["error"])
+                if resp.get("traceback"):
+                    print(resp["traceback"])
                 return 1
             return 0 if resp["ok"] else 1
 

@@ -11,7 +11,7 @@ language so the agent is transparent and easy to test:
     scroll <phrase> <n>       scroll n notches at the element (+up / -down)
     wait <seconds>            idle
     open <app>                tool step: launch/focus an app directly —
-                              firefox | file manager | applications
+                              firefox | file manager | terminal | applications
     search <query>            tool step: open Firefox on a DuckDuckGo
                               search for <query> (alias: duckduckgo <query>)
                               — the results page is shown; the agent
@@ -166,6 +166,8 @@ _OPEN_APPS = {
     "file manager": ("thunar", ("thunar",)),
     "files": ("thunar", ("thunar",)),
     "thunar": ("thunar", ("thunar",)),
+    "terminal": ("xfce4-terminal", ("xfce4-terminal",)),
+    "console": ("xfce4-terminal", ("xfce4-terminal",)),
 }
 _OPEN_APPS_MENU = frozenset({
     "applications", "applications menu", "application menu", "apps", "apps menu",
@@ -500,9 +502,17 @@ class Agent:
         t1 = time.time()
         while time.time() - t1 < 3.0:
             cap = screen.capture(scope="window")
+            w, h = cap.image.size
+            # Clamp the band to the live capture: a freshly mapped window
+            # is briefly captured smaller than the band while xfwm is
+            # still sizing it, and an unclamped px[x, y] read raises
+            # IndexError("image index out of range"). A too-small crop has
+            # few/no dark pixels, so the poll just keeps going until the
+            # window renders at full size.
+            x1, y1, x2, y2 = 120, 400, min(700, w), min(470, h)
             px = cap.image.convert("L").load()
-            dark = sum(1 for y in range(400, 470, 4)
-                       for x in range(120, 700, 8) if px[x, y] < 150)
+            dark = sum(1 for y in range(y1, y2, 4)
+                       for x in range(x1, x2, 8) if px[x, y] < 150)
             if dark > 20:
                 break
             time.sleep(0.1)

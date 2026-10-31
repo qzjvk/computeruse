@@ -276,7 +276,7 @@ Steps are separated by `;` or newlines. A bare phrase is treated as `click`.
 | `key <combo>`         | key combo, e.g. `ctrl+alt+t`, `enter`    |
 | `scroll <phrase> <n>` | scroll at the element (+up / −down)      |
 | `wait <seconds>`      | idle                                     |
-| `open <app>`          | tool step: launch/focus an app directly — `firefox`, `file manager`, `applications`. No grounding pass; the step returns only once the app's window has the focus, so a following `type`/`key` lands in it. Unknown apps fail loudly. |
+| `open <app>`          | tool step: launch/focus an app directly — `firefox`, `file manager`, `terminal`, `applications`. No grounding pass; the step returns only once the app's window has the focus, so a following `type`/`key` lands in it. Unknown apps fail loudly. |
 | `search <query>`      | tool step: open Firefox on a DuckDuckGo search for `<query>` (alias `duckduckgo <query>`). The results page is shown — the top result is *not* resolved server-side (that would pick the answer without the agent ever seeing the results); a following `click the first result in the search results` grounds and opens it. Flow: wait for the new Firefox window to take focus → Ctrl+L → type → Return → poll the window title until the results document loads, then poll until the results region has rendered (no fixed pauses). |
 | `wait-load`           | wait until the active window's title changes (a navigation produced a new page). A measured load wait — no fixed guess; capped at 8 s. |
 | `done`                | stop                                     |
