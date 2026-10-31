@@ -286,26 +286,45 @@ weaknesses:
   (DDG title, non-DDG title, terminal title, type/key run in the
   terminal). The model loses multi-part goals mid-run, so progress is
   tracked outside it.
-- **Suggestion protocol.** After a measured state signature (results
-  page up, page settled, terminal focused), the deterministic layer
-  proposes a concrete next machine step, selected from the goal's own
-  words (scroll count, "terminal", the quoted command):
-  `search → click first result → wait-load → scroll N → open terminal →
-  type <command verbatim> → enter → done`. The planner may override with
-  evidence; **after two deviations from the same pending suggestion the
-  system executes the suggestion itself** — canonical transitions are
-  controller-verified, so following them is always safe. A follow resets
-  the count; `done` is a planner decision and is never overridden. A
-  pending step that the repeat guard would block (already run in this
-  state) is dropped instead of anchoring the planner on a step that
-  cannot run.
+- **Suggestion fast-path (the latency design).** After a measured state
+  signature (results page up, page settled, terminal focused), the
+  deterministic layer proposes a concrete next machine step whose args are
+  extracted from the goal's own words (scroll count, "terminal", the
+  quoted command): `search → click first result → wait-load → scroll N →
+  open terminal → type <command verbatim> → enter → done`. When a pending
+  suggestion exists the system **executes it directly — no planning round
+  trip**: each suggestion is anchored on a measured signature, so
+  following it is always safe, and skipping the ~1–2 s LFM3 call keeps
+  canonical transitions at executor speed (measured: consulting the
+  planner per transition cost ~15 s of pure latency in the 9-step goal).
+  The planner keeps full authority over every turn *without* a pending
+  suggestion — goal start, states outside the canonical chain, recovery
+  after a failed step — and sees every executed result in the history.
+  `done` is suggested by the system once all subgoals are marked on
+  measured evidence (the 1.7B never calls done on its own).
+- **Decomposer-variance hardening.** The 1.7B decomposer's wording varies
+  run-to-run (it merged "type … and press Enter" into one subgoal, and
+  lifted the goal's terminal clause into a subgoal — run 15). So: a
+  subgoal asking for typing *and* Enter is marked at the Enter step, not
+  the type step; and a "call done when …" subgoal is a termination
+  condition, not an action — it is dropped at decomposition, since no
+  controller step could ever mark it and it would block the all-done
+  signal forever.
 - **Caps:** 32 steps, 180 s, 3 consecutive failures (blocked repeats
   count).
 
-The server is spawned at orchestrate start and stopped at the end — the
-card is shared with the LocateAnything worker, whose model reload peaks
-at ~6.8 GB fp16 and fits the 8 GB card only with headroom for LFM3's
-1.25 GiB; `entrypoint.sh` also kills stray llama-servers before each
+The server is spawned at orchestrate start and stopped at the end. The
+spawn pins the 1070 **alone** via `CUDA_VISIBLE_DEVICES`: llama.cpp's
+CUDA init creates a context on every *visible* device, and on this shared
+host the other two GPUs (RTX 3060s) can sit at under 1 GB free under the
+user's workloads — the `cudaSetDevice` there OOMs and aborts the whole
+load even though `--main-gpu` points at the 1070 (measured: worked while
+the 3060s had headroom, aborted at 110 MiB free). With the filter the
+1070 is device 0 (`--main-gpu 0`), the model loads in ~2.7 s, and the
+spawn is deterministic. The spawn also waits for ≥ 2.5 GB free on the
+1070 and retries (3×) — the card is shared with the LocateAnything
+worker, whose fp16 reload peaks at ~6.8 GB, and with the user's live
+desktop. `entrypoint.sh` also kills stray llama-servers before each
 worker load, and the planner re-ensures the server if it dies mid-run.
 `LFM3_PERSIST=1` keeps it warm between runs. The 1.05 GB GGUF is
 expected at `LFM3_MODEL` (downloaded at runtime, never committed).
@@ -326,13 +345,38 @@ thinking disabled, `tool_choice: required`.
 
 Measured on the 1070: the 9-step goal (search → open first result →
 scroll 3 → open terminal → type a verbatim `echo … > /root/note.txt` →
-Enter) completed in **3/3 clean runs: 15 planning steps, 38–39 s loop**
-(~67 s cold including the LFM3 spawn), with the exact file content +
-fresh mtime and the article still in the tab. Planning calls run ~1–2 s;
-the slow-navigation quirk (the first click's post-capture still shows
-the search page; a second click or the wait-load finishes it) costs ~8 s.
-The scripted path for the same goal is still the fast lane at
-11.5–12.1 s — orchestration is for goals that cannot be scripted.
+Enter) completes in **8 steps / 17–20 s loop, 1 planner call** (search is
+the only planning turn — every canonical transition is fast-path
+executed; ~22 s cold including the ~2.7 s LFM3 spawn), with the exact
+file content + fresh mtime and the article still in the tab. The
+wait-load catches the slow-navigation quirk mid-flight at 1.0–1.2 s
+(pre-capture title == post-capture title means the navigation is still
+in flight); when the title already moved within the 0.2 s post-capture
+window the fast path settles directly instead of burning the wait-load's
+8.1 s cap. The scripted path for the same goal is still the fast lane at
+~13 s — orchestration is for goals that cannot be scripted.
+
+**Resetting the desktop between runs.** Runs expect a clean desktop: no
+`/root/note.txt`, no terminal window, Firefox at about:blank. The reset
+is VERIFY-AND-RETRY, not fire-and-forget — `windowclose` was measured to
+transiently fail right after a run (the X server is busy), and a
+surviving terminal with a pending typed line poisoned the next run's
+output (run 15→15b: the leftover line was appended to and executed as
+one concatenated command):
+
+```bash
+docker exec cuasandbox bash -lc '
+  export DISPLAY=:99; rm -f /root/note.txt
+  for i in 1 2 3; do
+    xdotool search --name "Terminal" windowclose 2>/dev/null; sleep 0.5
+    [ -z "$(xdotool search --name "Terminal")" ] && break
+  done
+  xdotool search --name "Mozilla Firefox" windowactivate --sync
+  sleep 0.4; xdotool key ctrl+l; sleep 0.3
+  xdotool type "about:blank"; sleep 0.3; xdotool key Return; sleep 1.2
+  t=$(xdotool getactivewindow getwindowname)
+  [ "$t" = "Mozilla Firefox" ] && echo "desktop clean" || echo "RESET FAILED: $t"'
+```
 
 ### Task language
 
@@ -387,12 +431,12 @@ at the results, so it was removed.
 
 **Measured: a complex multi-app task in ~13 s.** The 9-step task "search a
 topic, open the top result, scroll the article, open a terminal, write a note
-file, press enter" spans two applications and runs in **12.5–15.1 s** on the
+file, press enter" spans two applications and runs in **13–15.6 s** on the
 1070 across the attach and launch paths (wall clock, the task's own waits
 included; earlier fresh-container runs took 11.5–12.1 s). No task-specific
 shortcuts: every step is grounded from pixels. The budget of the slowest
 verified run (launch path over a killed session whose restored tab carried a
-scroll position — the worst realistic state, 15.1 s):
+scroll position — the worst realistic state, ~15.6 s with the paced type):
 
 | Step | Cost | Why |
 |---|---|---|
@@ -402,10 +446,10 @@ scroll position — the worst realistic state, 15.1 s):
 | `wait-load` | 1.11 s | the title changed 1.09 s after the click; the settle gate adds 0.02 s |
 | `scroll the article 3` | 3.96 s | coarse grounding pass: the capture is downsampled to 300 vision patches (≤ 320) — a scroll target is a large region; the point only has to land inside it. ~30 s cheaper than the 4004-patch full-window pass; the full-res capture is still saved as evidence |
 | `open terminal` | 0.95 s | the `open` tool — no grounding pass; attaches to the running terminal window |
-| `type echo … > /root/note.txt` | 0.71 s | typed directly into the focused window |
+| `type echo … > /root/note.txt` | ~1.2 s | typed directly into the focused window, paced at ~100 chars/s (was 0.71 s at 5 ms/char — the faster burst was measured to drop the last characters of a long line on the loaded shared card) |
 | `key enter` | 0.01 s | — |
 
-(Attach-path re-runs: 12.5–12.7 s — search is 1.5–2.4 s instead of 4.9 s.)
+(Attach-path re-runs: 13–13.2 s — search is 1.5–2.4 s instead of 4.9 s.)
 Verified on each run: `/root/note.txt` contains the echoed line, the correct
 article is open (not the second or third result), and the article actually
 scrolled — the article region differs by 37–57 % of its pixels between the

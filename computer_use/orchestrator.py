@@ -27,6 +27,21 @@ Division of labor:
                        planner by design — the title and the frame diff
                        are the evidence channel.
 
+Suggestion fast-path (the latency design): after a measured state
+signature (results page up, page settled, terminal focused) the
+deterministic layer proposes a concrete next machine step whose args
+are extracted from the goal's own words (scroll count, "terminal", the
+quoted command). When such a pending suggestion exists the system
+EXECUTES IT DIRECTLY — no planning round trip — because it is
+controller-verified and goal-faithful by construction (measured: the
+1.7B planner deviated from nearly every canonical suggestion in the
+9-step goal; consulting it per transition cost ~15 s of pure latency).
+The planner keeps full authority over every turn WITHOUT a pending
+suggestion — goal start, states outside the canonical chain, recovery
+after a failed step — and sees every executed result in the history.
+``done`` is suggested by the system once every subgoal is marked on
+measured evidence (the 1.7B never calls done on its own).
+
 The LFM3 server is started lazily (on the first orchestrate request) by
 the process that owns the LocateAnything worker, pinned to the GTX 1070
 by NAME in torch's CUDA enumeration (nvidia-smi indices do not match
@@ -213,13 +228,28 @@ class PlannerError(RuntimeError):
     """The planner produced no usable step (transport or format)."""
 
 
+def _is_done_directive(s: str) -> bool:
+    """True if the subgoal is the 'call done' instruction itself, not an
+    action. The decomposer sometimes lifts the goal's terminal clause into
+    a subgoal ('Call done when everything is complete.' / 'Done when the
+    file is created.'). The system calls done when every ACTION subgoal is
+    marked on measured evidence, so such a line is unsatisfiable by any
+    controller step and would block the all-done signal forever
+    (measured: run 15).
+    """
+    t = s.strip().lower()
+    return bool(re.search(r"\bcall\s*done\b|\bdone\s*when\b|\bmark\s*done\b", t)
+                or t.startswith("done"))
+
+
 class Planner:
     """One planning call = one HTTP round trip to the LFM3 server.
 
-    The full compact history is re-sent every call (goal + one line per
-    executed step): at ~200 tokens/step a 15-step task is ~3K prompt
-    tokens, which prefill takes ~1-2 s on the 1070 — the price of the
-    planner being stateless.
+    The recent history is re-sent every call (the goal block's
+    [DONE]/[NEXT] marks carry the earlier progress, so only the last
+    ~12 lines go out): the prompt stays ~1-2K tokens, ~1 s of prefill
+    on the 1070 instead of the ~3-4 s a 32-step full history would
+    cost (measured 380-1480 tok/s).
     """
 
     def __init__(self, base_url: str | None = None, timeout: float = 180.0):
@@ -285,7 +315,10 @@ class Planner:
             # the two RTX 3060s are ~95% occupied by other workloads, so
             # a spread load OOMs on their first compute buffer (measured).
             "--split-mode", "none",
-            "--main-gpu", str(self._gpu_index()),
+            # main-gpu 0: with CUDA_VISIBLE_DEVICES filtering to the
+            # 1070 alone (see _spawn), it is device 0 of the filtered
+            # enumeration.
+            "--main-gpu", "0",
             "-c", ctx,
             "--host", "127.0.0.1", "--port", port,
             "--no-ui",
@@ -293,20 +326,96 @@ class Planner:
             "--jinja",
         ]
         log = open("/tmp/lfm3-server.log", "ab")
+        gpu_idx = self._gpu_index()
         print(f"[planner] spawning {bin_path} (model={os.path.basename(model)}, "
-              f"gpu={self._gpu_index()}, ctx={ctx}, port={port}); "
+              f"gpu={gpu_idx} [1070], ctx={ctx}, port={port}); "
               f"log /tmp/lfm3-server.log", flush=True)
         self._proc = subprocess.Popen(
-            cmd, stdout=log, stderr=subprocess.STDOUT, env=env,
+            cmd, stdout=log, stderr=subprocess.STDOUT,
+            env={**env,
+                 # The 1070 ALONE: llama.cpp's CUDA init creates a
+                 # context on every visible device. On this shared host
+                 # the other GPUs (two RTX 3060s, ~95% occupied by the
+                 # user's workloads) can be down to < 1 GB free, and the
+                 # cudaSetDevice there OOMs and aborts the whole load —
+                 # even though --main-gpu points at the 1070 (measured:
+                 # worked while the 3060s had headroom, aborted at
+                 # 110 MiB free). Hiding them makes the load
+                 # deterministic; after the filter the 1070 is device 0.
+                 "CUDA_VISIBLE_DEVICES": str(gpu_idx)},
             start_new_session=True)
 
+    def _free_vram_mib(self) -> int:
+        """Free VRAM on the 1070, via nvidia-smi, found by NAME
+        (nvidia-smi indices do NOT match torch/cuda indices on this
+        host — see entrypoint.sh). 0 when unreadable."""
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name,memory.free",
+                 "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=10).stdout
+            for line in out.splitlines():
+                name, _, free = line.partition(",")
+                if "1070" in name:
+                    return int(free.strip().split()[0])
+        except Exception:
+            pass
+        return 0
+
+    def _wait_vram_headroom(self, need_mib: int = 2560,
+                            timeout: float = 120.0) -> None:
+        """Wait until the shared 1070 has headroom for the Q4 weights +
+        context. llama.cpp's CUDA context init OOMs on a full card
+        (measured: cudaSetDevice 'out of memory' at 0.5 s while the card
+        held the worker + a desktop spike); the card is shared with the
+        user's live desktop, so such spikes happen."""
+        free = self._free_vram_mib()
+        if not free:
+            return  # nvidia-smi unreadable: proceed, the error will say
+        if free < need_mib:
+            print(f"[planner] 1070 free VRAM {free} MiB < ~{need_mib} "
+                  f"needed; waiting for the shared card to clear...",
+                  flush=True)
+        deadline = time.time() + timeout
+        while free < need_mib and time.time() < deadline:
+            time.sleep(2)
+            free = self._free_vram_mib() or 0
+        if free < need_mib:
+            print(f"[planner] still only {free} MiB free after "
+                  f"{timeout:.0f} s; attempting the spawn anyway",
+                  flush=True)
+        else:
+            print(f"[planner] 1070 free VRAM {free} MiB — spawning",
+                  flush=True)
+
     def ensure_server(self, wait: float = 90.0) -> None:
-        """Ready (health ok) or spawn and wait until it is."""
+        """Ready (health ok), or spawn and wait until it is.
+
+        Retries the spawn: a cold CUDA init on the shared card can
+        transiently OOM (measured) or a slow load can overrun the wait;
+        each attempt first waits for VRAM headroom.
+        """
+        last = ""
+        for attempt in range(1, 4):
+            try:
+                self._ensure_once(wait)
+                return
+            except PlannerError as e:
+                last = str(e)
+                self._proc = None  # dead/partial: next attempt respawns
+                print(f"[planner] LFM3 spawn failed (attempt {attempt}/3): "
+                      f"{str(e).splitlines()[0]}; the card is shared — "
+                      f"waiting for headroom and retrying", flush=True)
+                time.sleep(3)
+        raise PlannerError(last)
+
+    def _ensure_once(self, wait: float) -> None:
         if self.health():
             return
         if self._proc is not None and self._proc.poll() is None:
             pass  # already starting: just wait below
         else:
+            self._wait_vram_headroom()
             self._spawn()
         deadline = time.time() + wait
         while time.time() < deadline:
@@ -380,6 +489,14 @@ class Planner:
                              line.strip())
                 if m and m.group(1).strip():
                     subs.append(m.group(1).strip())
+            # Drop subgoals that are the "call done" instruction itself
+            # rather than an action (measured: run 15's decomposer lifted
+            # the goal's terminal clause into a subgoal — 'Call done when
+            # the file is created with that content.'). The system calls
+            # done when every ACTION subgoal is marked on measured
+            # evidence, so such a line has no controller step that could
+            # mark it and would block the all-done signal forever.
+            subs = [s for s in subs if not _is_done_directive(s)]
             if subs:
                 return subs[:6]
             print(f"[planner] decompose gave no usable list "
@@ -398,7 +515,8 @@ class Planner:
         Retries: a transport failure re-checks the server (it may have
         died); a non-tool reply gets one corrective nudge.
         """
-        hist = "\n".join(history) if history else "no steps executed yet"
+        hist = ("\n".join(history[-12:]) if history
+                else "no steps executed yet")
         user = (f"Goal: {goal}\n\nHistory:\n{hist}\n\n"
                 "What is the next step?")
         messages = [
@@ -721,11 +839,18 @@ class OrchestratedAgent:
             terminal_up = "terminal" in post.lower()
             if "terminal" in s:
                 # 'type'/'echo' only: 'run the command' belongs to the
-                # enter branch, not the type branch.
+                # enter branch, not the type branch. A subgoal that asks
+                # for typing AND pressing Enter is marked at the ENTER
+                # step, never at the type step (measured: run 15's
+                # decomposer merged the two — 'Type exactly: `echo ...`
+                # and press Enter.' marked at the type step would leave
+                # the command unexecuted when all_done fired).
                 if (("type" in s or "echo" in s)
+                        and "enter" not in s and "press" not in s
                         and name == "type" and terminal_up):
                     marks[idx] = changed = True
-                elif (("enter" in s or "execute" in s or "run" in s)
+                elif (("enter" in s or "press" in s
+                       or "execute" in s or "run" in s)
                         and name == "key" and "enter" in args_str
                         and terminal_up):
                     marks[idx] = changed = True
@@ -747,51 +872,80 @@ class OrchestratedAgent:
             # type/enter subgoals are marked by WHERE the step ran —
             # the measured terminal title — not the subgoal's words.
             elif (("type" in s or "echo" in s)
+                    and "enter" not in s and "press" not in s
                     and name == "type" and terminal_up):
                 marks[idx] = changed = True
-            elif (("enter" in s or "execute" in s or "run" in s)
+            elif (("enter" in s or "press" in s
+                   or "execute" in s or "run" in s)
                     and name == "key" and "enter" in args_str
                     and terminal_up):
                 marks[idx] = changed = True
         return changed
+
+    def _settled_next(self, post: str,
+                      goal_block: str) -> tuple[str, tuple[str, dict] | None] | None:
+        """The canonical next step once the current page has settled.
+
+        Shared by the wait-load branch (the wait finished) and the
+        fast-path click branch (the title already moved within the
+        0.2 s post-capture window, so a wait-load would only compare
+        against an already-changed title and burn its full cap —
+        measured 8.1 s).
+        """
+        low = goal_block.lower()
+        if "duckduckgo" in post.lower():
+            if re.search(r"\bresult", goal_block, re.I):
+                return ("SUGGESTED NEXT: click "
+                        "{\"phrase\": \"the first result in the search "
+                        "results\"} (the results page is still up and "
+                        "the goal wants a result).",
+                        ("click",
+                         {"phrase": "the first result in the search results"}))
+            return ("SUGGESTED NEXT: continue with the next unfinished "
+                    "subgoal (the page has settled).", None)
+        if re.search(r"\bscroll", low):
+            n = self._scroll_amount(goal_block)
+            args = {"phrase": "the article", "amount": n}
+            return (f"SUGGESTED NEXT: scroll {json.dumps(args)} "
+                    f"(the page has settled and the goal wants the "
+                    f"article scrolled {n} notches).",
+                    ("scroll", args))
+        return ("SUGGESTED NEXT: continue with the next unfinished "
+                "subgoal (the page has settled).", None)
 
     def _suggestion(self, name: str, ok: bool, pre: str, post: str,
                     goal_block: str,
                     all_done: bool = False) -> tuple[str, tuple[str, dict] | None] | None:
         """The canonical next step, suggested by the deterministic layer.
 
-        Returns (history_line, (tool_name, args) | None). The machine
-        part is the step the system will itself execute if the planner
-        deviates twice (see _run_loop): the 1.7B planner is not reliable
-        on canonical micro-transitions (measured: it repeated a finished
-        search 3x across runs, fixated on re-clicking the first result
-        even after the article had opened, and never called done even
-        with every subgoal marked [DONE]), but each suggestion only
-        fires on a MEASURED state signature (a DDG title means the
-        controller's verified _search finished; a terminal title means
-        _open verified focus; all-done means every subgoal was marked
-        on measured evidence), so following one is always safe — while
-        the planner keeps full freedom to override with evidence (that
-        is what makes it a planner, not a script). The chain covered:
+        Returns (history_line, (tool_name, args) | None). When the
+        machine part is not None, _run_loop EXECUTES IT DIRECTLY (no
+        planning round trip): each suggestion only fires on a MEASURED
+        state signature (a DDG title means the controller's verified
+        _search finished; a terminal title means _open verified focus;
+        all-done means every subgoal was marked on measured evidence)
+        and its args are extracted from the goal's own words (scroll
+        count, 'terminal', the quoted command), so following it is
+        always safe. The planner keeps full authority over every turn
+        without a pending suggestion. The chain covered:
         search->click->wait-load->scroll->open terminal->type->enter
-        ->done, selected from the goal's own words (scroll count,
-        'terminal', the quoted command).
+        ->done.
         """
         if not ok:
             return None
         if all_done:
             # Every subgoal is marked on MEASURED evidence, so the goal
             # is achieved by construction; the marks ARE the done
-            # evidence. The planner still gets two turns to disagree
-            # (e.g. observe) before the system stops itself.
+            # evidence. Executed directly by the protocol — the 1.7B
+            # planner never called done on its own even with every
+            # subgoal marked [DONE] (measured).
             subs = [m.group(1) for m in re.finditer(
                 r"^\d+\. \[DONE\] (.+)$", goal_block, re.M)]
             summary = "all subgoals done: " + "; ".join(subs) if subs \
                 else "all subgoals done"
             return ("SUGGESTED NEXT: done — every subgoal is [DONE] "
                     "(verified by titles, frame changes and window "
-                    "state). Call done. Override only with evidence a "
-                    "subgoal actually failed.",
+                    "state).",
                     ("done", {"summary": summary}))
         low = goal_block.lower()
         results_page = "duckduckgo" in post.lower()
@@ -799,35 +953,27 @@ class OrchestratedAgent:
             if re.search(r"\bresult", goal_block, re.I):
                 return ("SUGGESTED NEXT: click "
                         "{\"phrase\": \"the first result in the search "
-                        "results\"}, then wait-load (the results page is "
-                        "up and the goal wants a result). Override only "
-                        "if you have evidence the page is not a results "
-                        "page.",
+                        "results\"} (the results page is up and the "
+                        "goal wants a result).",
                         ("click",
                          {"phrase": "the first result in the search results"}))
         if name == "click":
-            return ("SUGGESTED NEXT: wait-load {} (the click may be "
-                    "navigating; wait for the new page before acting). "
-                    "Override only if you have evidence nothing "
-                    "navigated.",
-                    ("wait-load", {}))
+            if "duckduckgo" in pre.lower() and post == pre:
+                # Title unchanged: the navigation may still be in
+                # flight (measured slow-nav quirk: the 0.2 s
+                # post-capture after the click still shows the results
+                # page); wait for it to land.
+                return ("SUGGESTED NEXT: wait-load {} (the click may "
+                        "still be navigating; wait for the new page "
+                        "before acting).",
+                        ("wait-load", {}))
+            # The title already moved (fast nav) or the click was not
+            # on a results page: settle directly — a wait-load here
+            # would compare against an already-changed title and burn
+            # its full cap (measured 8.1 s).
+            return self._settled_next(post, goal_block)
         if name == "wait-load":
-            if results_page and re.search(r"\bresult", goal_block, re.I):
-                return ("SUGGESTED NEXT: click "
-                        "{\"phrase\": \"the first result in the search "
-                        "results\"} (the results page is still up and "
-                        "the goal wants a result).",
-                        ("click",
-                         {"phrase": "the first result in the search results"}))
-            if re.search(r"\bscroll", low):
-                n = self._scroll_amount(goal_block)
-                args = {"phrase": "the article", "amount": n}
-                return (f"SUGGESTED NEXT: scroll {json.dumps(args)} "
-                        f"(the page has settled and the goal wants the "
-                        f"article scrolled {n} notches).",
-                        ("scroll", args))
-            return ("SUGGESTED NEXT: continue with the next unfinished "
-                    "subgoal (the page has settled).", None)
+            return self._settled_next(post, goal_block)
         if name == "scroll":
             if re.search(r"\bterminal\b", low) and "terminal" not in post.lower():
                 return ("SUGGESTED NEXT: open {\"app\": \"terminal\"} "
@@ -893,11 +1039,23 @@ class OrchestratedAgent:
     def _run_loop(self, goal: str, subgoals: list[str],
                   history: list[str], t0: float, seen_steps: dict) -> bool:
         consec_fail = 0
-        # Suggestion protocol state: the deterministic layer's pending
-        # machine suggestion (see _suggestion) and how many times the
-        # planner has deviated from it.
+        # Suggestion fast-path state: the deterministic layer's pending
+        # machine suggestion (see _suggestion). When one exists the
+        # system executes it DIRECTLY — no planning round trip: a
+        # pending suggestion is anchored on a measured state signature
+        # (results page up, page settled, terminal focused) and its
+        # args are extracted from the goal's own words (scroll count,
+        # the quoted command), so following it is always safe, and
+        # skipping the ~1-2 s LFM3 call keeps canonical transitions at
+        # executor speed. Measured: the 1.7B planner deviated from
+        # nearly every canonical suggestion in the 9-step goal (fixated
+        # on re-scrolling); consulting it per transition cost 15 calls
+        # ≈ 15 s of pure latency for 6 transitions the controller could
+        # execute directly. The planner keeps full authority over every
+        # turn WITHOUT a pending suggestion — goal start, states outside
+        # the canonical chain (a stale drop), recovery after a failed
+        # step — and it sees every executed result in the history.
         pending: tuple[str, dict] | None = None
-        deviations = 0
         # Deterministic subgoal progress (see _mark_subgoals); rebuilt
         # into the goal block before every planning call.
         marks = [False] * len(subgoals)
@@ -907,44 +1065,20 @@ class OrchestratedAgent:
                       f"stopping at step {i + 1}", flush=True)
                 return False
             goal_block = self._goal_block(goal, subgoals, marks)
-            try:
-                name, args = self.planner.plan(goal_block, history)
-            except PlannerError as e:
-                print(f"[orch] planner error at step {i + 1}: {e}", flush=True)
-                return False
-            # Suggestion protocol: after a measured state signature the
-            # deterministic layer proposes a concrete next step (pending).
-            # The planner may override it with evidence, but after two
-            # deviations from the same pending suggestion the system
-            # executes the suggested step itself — canonical transitions
-            # are controller-verified, so following them is always safe
-            # (measured: the 1.7B planner repeated a finished search 3x
-            # across runs, ignoring prose hints). A follow resets the
-            # count. 'done' is a planner decision and is never overridden.
-            follow = overridden = False
-            if pending is not None and name != "done":
-                # Compare canonical (name, args-json) pairs: pending is
-                # stored as (name, dict), so compare both sides as
-                # strings (measured: comparing the dict side directly
-                # made every FOLLOW count as a deviation, ratcheting the
-                # override into the repeat guard — run 9).
-                p_name, p_args = pending
-                if (name, json.dumps(args, sort_keys=True,
-                                     ensure_ascii=False)) == \
-                        (p_name, json.dumps(p_args, sort_keys=True,
-                                            ensure_ascii=False)):
-                    follow = True
-                else:
-                    deviations += 1
-                    if deviations >= 2:
-                        overridden = True
-                        p_name, p_args = pending
-                        print(f"[orch] step {i + 1}: planner deviated twice "
-                              f"from the suggested step; executing the "
-                              f"suggestion instead ({p_name} "
-                              f"{json.dumps(p_args, ensure_ascii=False)})",
-                              flush=True)
-                        name, args = p_name, p_args
+            if pending is not None:
+                name, args = pending
+                pending = None
+                print(f"[orch] step {i + 1}: protocol: executing the "
+                      f"suggested step ({name} "
+                      f"{json.dumps(args, ensure_ascii=False)})",
+                      flush=True)
+            else:
+                try:
+                    name, args = self.planner.plan(goal_block, history)
+                except PlannerError as e:
+                    print(f"[orch] planner error at step {i + 1}: {e}",
+                          flush=True)
+                    return False
             print(f"[orch] step {i + 1}: {name} "
                   f"{json.dumps(args, ensure_ascii=False)}", flush=True)
             if name == "done":
@@ -1008,28 +1142,16 @@ class OrchestratedAgent:
                 consec_fail = 0
             history.append(line)
             print("    " + line, flush=True)
-            # Update the pending suggestion from the step just run.
-            if blocked:
-                # The world did not move. If the blocked step WAS the
-                # pending suggestion (a blocked follow or a blocked
-                # override), the suggestion is proven stale in this
-                # state: drop it and reset the deviation ratchet —
-                # otherwise the system re-executes the same blocked step
-                # every iteration until the failure budget burns
-                # (measured: run 9, three blocked wait-loads in a row).
-                # A blocked step that is NOT the suggestion leaves the
-                # suggestion in place: the world did not move, so the
-                # previous suggestion is still the right next step.
-                if follow or overridden:
-                    pending = None
-                    deviations = 0
-            elif follow or overridden or post != pre or float(frame_pct) > 0.0:
-                # The state signature moved (or the suggestion was just
-                # fulfilled): supersede it with a fresh one from the new
-                # state. Diagnostic no-ops (observe, verify, wait, a
-                # failed step) leave the pending suggestion in place.
-                if follow or overridden:
-                    deviations = 0
+            # Update the pending suggestion from the step just run. An
+            # EXECUTED step (ok or failed) recomputes the canonical next
+            # step from the new state — including no-ops: the stale
+            # check below (and the repeat guard) make re-proposals safe.
+            # _suggestion returns None for failed steps, so a failure
+            # hands the wheel back to the planner (the failure note is
+            # in the history). A BLOCKED step executed nothing and moved
+            # nothing; no pending exists at execution time (it was
+            # consumed above), so the planner simply re-plans next turn.
+            if not blocked:
                 self._mark_subgoals(subgoals, marks, name, ok, args, post)
                 # The fresh block (post-step marks) is what the planner
                 # will see next turn, and it is what the done-summary
@@ -1037,7 +1159,8 @@ class OrchestratedAgent:
                 sug = self._suggestion(name, ok, pre, post,
                                        self._goal_block(goal, subgoals,
                                                         marks),
-                                       all_done=all(marks))
+                                       all_done=bool(marks)
+                                       and all(marks))
                 if sug is None:
                     pending = None
                 elif sug[1] is None:
@@ -1051,10 +1174,10 @@ class OrchestratedAgent:
                     if seen_steps.get(m_key) == post:
                         # The suggested step was already executed in this
                         # exact state: the repeat guard would block it,
-                        # so it is stale. Anchoring the planner on a step
-                        # that cannot run traps it (measured: the system
-                        # re-executed a blocked wait-load 3x and burned
-                        # the failure budget).
+                        # so it is stale. Anchoring on a step that cannot
+                        # run traps the loop (measured: run 9, three
+                        # blocked wait-loads in a row burned the failure
+                        # budget).
                         pending = None
                         history.append(
                             "SUGGESTED NEXT: continue with the next "
@@ -1062,7 +1185,7 @@ class OrchestratedAgent:
                             "is pending).")
                     else:
                         history.append(sug_line)
-                        pending, deviations = machine, 0
+                        pending = machine
 
             if self.agent.dry_run and i == 0:
                 # A dry run never changes the world, so "achieve the goal"

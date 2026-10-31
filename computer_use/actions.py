@@ -54,9 +54,16 @@ def move(x: float, y: float, dry_run: bool = False) -> None:
     _pg().moveTo(x, y)
 
 
-def type_text(text: str, interval: float = 0.005, dry_run: bool = False) -> None:
+def type_text(text: str, interval: float = 0.01, dry_run: bool = False) -> None:
     """Type ASCII text. Non-ASCII characters are typed as empty placeholders;
-    for unicode input use `key` combos or a helper like `xdotool type`."""
+    for unicode input use `key` combos or a helper like `xdotool type`.
+
+    Paced at ~100 chars/s (10 ms): the desktop is shared with a live user
+    workload, and a faster XTest burst was measured to drop the last
+    characters of a long command line (truncating `> /root/note.txt` to
+    `> /root/notet` — run 15, the pending line then poisoned the next
+    run). 0.5 s per 100 chars is negligible against the step budget.
+    """
     _log(f"type {text!r}", dry_run)
     if dry_run:
         return
