@@ -6,7 +6,10 @@ agent can be exercised end-to-end without moving the mouse.
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 import time
+from typing import Optional
 
 # pyautogui (via mouseinfo) opens an X11 connection at import time, so it is
 # imported lazily on first real action. That keeps the agent importable (and
@@ -94,3 +97,27 @@ def drag_to(x1: float, y1: float, x2: float, y2: float, duration: float = 0.5, d
 
 def pause(seconds: float) -> None:
     time.sleep(seconds)
+
+
+def launch(command: str, dry_run: bool = False) -> Optional[str]:
+    """Launch a detached GUI application (e.g. "thunar" or
+    "firefox --no-sandbox"), inheriting the agent's X display.
+
+    The child runs in its own session and outlives the agent process; its
+    stdout/stderr go to /dev/null so a chatty app (browser console) never
+    drowns the agent's log. Returns the resolved binary, or None if no
+    candidate is installed.
+    """
+    binary = command.split()[0]
+    if shutil.which(binary) is None:
+        return None
+    _log(f"launch {command}", dry_run)
+    if dry_run:
+        return binary
+    subprocess.Popen(
+        command.split(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return binary

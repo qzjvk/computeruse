@@ -10,6 +10,8 @@ language so the agent is transparent and easy to test:
     key <combo>               press a key combo, e.g. ctrl+alt+t
     scroll <phrase> <n>       scroll n notches at the element (+up / -down)
     wait <seconds>            idle
+    open <app>                tool step: launch/focus an app directly —
+                              firefox | file manager | applications
     done                      stop
 
 Steps are separated by ';' or newlines. A bare phrase is treated as `click`.
@@ -18,6 +20,7 @@ Steps are separated by ';' or newlines. A bare phrase is treated as `click`.
 from __future__ import annotations
 
 import re
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,7 +35,7 @@ ImageLike = Union[str, None]
 _VERB_RE = re.compile(
     r"^\s*(?P<verb>"
     r"click|left[- ]?click|double[- ]?click|right[- ]?click|"
-    r"type|key|scroll|wait|done"
+    r"type|key|scroll|wait|open|done"
     r")\s*(?P<arg>.*?)\s*$",
     re.IGNORECASE,
 )
@@ -97,6 +100,52 @@ _EDGE_STRIP_H = 64
 # (measured: "Applications" at y=43 of a 64 px strip — below the 27 px bar —
 # vs y=2-6 in a 48 px strip, on the button).
 _EDGE_STRIP_H_TOP = 48
+
+# `open <app>` tools (Agent._open): launch/focus an app directly instead of
+# grounding its launcher icon. They cover the common app-launch actions —
+# which are exactly where grounding is weakest (measured: "file manager
+# icon" deterministically lands on the directory-menu icon, a semantic bias
+# that upscaling does not fix) — and each saves one model pass. The step
+# returns only when the app's window holds the focus, so a following
+# type/key step always lands in the right place. Value: (launch command,
+# WM_CLASS match tokens). Firefox needs --no-sandbox: the sandbox runs as
+# root, same as the entrypoint's own launch.
+_OPEN_APPS = {
+    "firefox": ("firefox --no-sandbox", ("firefox", "navigator")),
+    "firefox browser": ("firefox --no-sandbox", ("firefox", "navigator")),
+    "web browser": ("firefox --no-sandbox", ("firefox", "navigator")),
+    "browser": ("firefox --no-sandbox", ("firefox", "navigator")),
+    "file manager": ("thunar", ("thunar",)),
+    "files": ("thunar", ("thunar",)),
+    "thunar": ("thunar", ("thunar",)),
+}
+_OPEN_APPS_MENU = frozenset({
+    "applications", "applications menu", "application menu", "apps", "apps menu",
+})
+
+
+def _xdotool(*args: str) -> str:
+    """Run xdotool, returning stdout ('' on any failure)."""
+    try:
+        r = subprocess.run(["xdotool", *args], capture_output=True,
+                           text=True, timeout=5)
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _visible_window_ids() -> set[str]:
+    """Top-level visible window ids."""
+    return {t for t in _xdotool("search", "--onlyvisible", "--name", ".").split()
+            if t.isdigit()}
+
+
+def _window_class(wid: str) -> str:
+    """WM_CLASS of a window as 'instance,Class' (xprop output format)."""
+    out = subprocess.run(["xprop", "-id", str(wid), "WM_CLASS"],
+                         capture_output=True, text=True, timeout=5).stdout
+    m = re.search(r'"([^"]*)",\s*"([^"]*)"', out)
+    return f"{m.group(1)},{m.group(2)}" if m else out
 
 
 def _container_of(phrase: str) -> Optional[str]:
@@ -207,6 +256,8 @@ class Agent:
         if step.verb == "key":
             actions.hotkey(step.arg, dry_run=self.dry_run)
             return True
+        if step.verb == "open":
+            return self._open(step.arg, i)
 
         # All remaining verbs need a grounded target.
         if step.verb == "scroll":
@@ -231,6 +282,76 @@ class Agent:
 
         if self.delay > 0:
             actions.pause(self.delay)
+        return True
+
+    # ------------------------------------------------------------ open tools
+
+    def _open(self, arg: str, i: int) -> bool:
+        """`open <app>`: a tool step — launch/focus the app, no grounding."""
+        name = arg.lower().strip()
+        if name.startswith("the "):
+            name = name[4:].strip()
+        if name in _OPEN_APPS_MENU:
+            return self._open_applications_menu(i)
+        entry = _OPEN_APPS.get(name)
+        if entry is None:
+            print(f"    [open] no tool for {arg!r}; known apps: "
+                  f"{', '.join(sorted(_OPEN_APPS))}, applications")
+            return False
+        command, class_tokens = entry
+        if self.dry_run:
+            print(f"    [action (dry-run)] open {arg!r} ({command})")
+            return True
+        before = _visible_window_ids()
+        if actions.launch(command) is None:
+            print(f"    [open] binary not found: {command.split()[0]!r}")
+            return False
+        print(f"    [action] launch {command}; waiting for focus (class {class_tokens})")
+        if self._wait_app_focus(class_tokens, before, timeout=15.0):
+            actions.pause(0.8)  # let the app settle before the next step types
+            return True
+        print("    [open] the app window did not take focus within 15 s")
+        return False
+
+    def _wait_app_focus(self, class_tokens: tuple[str, ...], exclude: set[str],
+                        timeout: float) -> bool:
+        """Activate the first new window whose WM_CLASS matches
+        ``class_tokens``; also accept the app already holding the focus
+        (singleton launchers can race the window-id poll).
+        """
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            for wid in sorted(_visible_window_ids() - exclude):
+                cls = _window_class(wid).lower()
+                if any(t in cls for t in class_tokens):
+                    _xdotool("windowactivate", "--sync", wid)
+                    return True
+            active = _xdotool("getactivewindow")
+            if active and any(t in _window_class(active).lower() for t in class_tokens):
+                return True
+            time.sleep(0.3)
+        return False
+
+    def _open_applications_menu(self, i: int) -> bool:
+        """`open applications`: click the Applications button in the top
+        menu bar. Reuses the deterministic top-strip path — the strip is
+        full-width, so it tracks the resolution (verified hit: (81,2) on
+        1080p; the button is the leftmost menu-bar item on every XFCE).
+        """
+        if self.dry_run:
+            print("    [action (dry-run)] open applications menu")
+            return True
+        cap = screen.capture(scope="screen", monitor_index=self.monitor)
+        target = self._ground_capture(cap, "Applications in the menu bar")
+        if target is None:
+            print("    [open] applications menu button not grounded")
+            return False
+        ix, iy = target
+        ax, ay = cap.to_screen(ix, iy)
+        print(f"    target     : image=({ix:.0f}, {iy:.0f})  desktop=({ax:.0f}, {ay:.0f})  "
+              f"[{cap.image.width}x{cap.image.height}]")
+        actions.click(ax, ay, dry_run=False)
+        actions.pause(0.5)  # let the menu popup open before the next step
         return True
 
     # -------------------------------------------------------------- ground

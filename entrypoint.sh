@@ -18,7 +18,12 @@ export DISPLAY=:99
 # Xvfb corrupts the XCB/XShmGetImage path mss 10 uses by default; the
 # legacy Xlib XGetImage backend is clean (verified against `import`).
 export CUA_MSS_BACKEND=xlib
-Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX &
+# 720p, not 1080p: the full screen is then 4641 vision patches instead of
+# 10549, so a full-frame step is ONE ~0.94x pass (~29 s on the 1070) instead
+# of a 4-tile pass (~67 s), and the model sees the UI at near-native scale
+# instead of down-scaled tiles. The edge strips (64/48 px) are unaffected:
+# they are full-width crops either way.
+Xvfb :99 -screen 0 1280x720x24 -ac +extension GLX &
 
 sleep 3
 eval "$(dbus-launch --sh-syntax)"

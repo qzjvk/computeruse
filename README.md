@@ -193,8 +193,9 @@ sent with each task. `--no-server` forces a local load. Measured on the 1070:
 If you want the agent to run while you are still using the machine, give it
 its own XFCE desktop in Docker. It is managed with docker compose
 (`docker-compose.yml` + the `./sandbox.sh` wrapper): Xvfb + XFCE at
-1920×1080, a noVNC browser view **plus a raw VNC port (5900) for native
-clients**, and a resident `serve` worker **pinned to the GTX 1070**. The
+1280×720 (720p is deliberate — see below), a noVNC browser view **plus a raw
+VNC port (5900) for native clients**, and a resident `serve` worker
+**pinned to the GTX 1070**. The
 card is found by name in CUDA's own device enumeration — nvidia-smi
 indices do not match torch/cuda indices on this host, and the index can
 change across boots; without the card the worker falls back to auto-pick
@@ -242,6 +243,12 @@ Notes:
   matches the kernel module.
 - `locatenv/` is bind-mounted read-only into the container, so no copy of
   the weights is needed.
+- **720p, not 1080p**: the full 1280×720 screen is 4641 vision patches,
+  just over the 4096 token budget, so a full-frame step is ONE ~0.94× pass
+  (~29 s on the 1070) instead of the 1080p 4-tile pass (~67 s) — and the
+  model sees the UI at near-native scale instead of down-scaled tiles. The
+  edge strips (64 px bottom / 48 px top) are full-width either way and are
+  unaffected.
 - Ports 6090 (noVNC) and 5900 (raw VNC) are used because 6080 is already
   taken on this host; change `docker-compose.yml` and `entrypoint.sh` if
   you move them.
@@ -259,7 +266,14 @@ Steps are separated by `;` or newlines. A bare phrase is treated as `click`.
 | `key <combo>`         | key combo, e.g. `ctrl+alt+t`, `enter`    |
 | `scroll <phrase> <n>` | scroll at the element (+up / −down)      |
 | `wait <seconds>`      | idle                                     |
+| `open <app>`          | tool step: launch/focus an app directly — `firefox`, `file manager`, `applications`. No grounding pass; the step returns only once the app's window has the focus, so a following `type`/`key` lands in it. Unknown apps fail loudly. |
 | `done`                | stop                                     |
+
+The `open` tools exist because app launching is exactly where icon grounding
+is weakest (measured: "file manager icon" in the panel deterministically
+lands on the directory-menu icon — a semantic bias that upscaling the strip
+does not fix) and because each saves a model pass. Everything else still
+goes through the VL grounding above.
 
 ## GTX 1070 notes
 
@@ -300,7 +314,7 @@ computer_use/
 ├── worker.py       # model loading + inference (1070-tuned), GroundingResult
 ├── grounding.py    # parse <box><x>…</box> output into pixel coords
 ├── screen.py       # mss screenshot capture + monitor coordinate mapping
-├── actions.py      # pyautogui click/type/key/scroll (dry-run aware)
+├── actions.py      # pyautogui click/type/key/scroll + detached launch (dry-run aware)
 ├── controller.py   # task language + perceive→ground→act loop
 ├── server.py       # resident worker: model stays in VRAM, tasks over a Unix socket
 └── __main__.py     # CLI (agent / offline / serve)

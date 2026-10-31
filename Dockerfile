@@ -8,7 +8,7 @@
 #
 # Or just: ./sandbox.sh up
 #
-# Inside: Xvfb + XFCE (1920x1080), noVNC on http://localhost:6090/vnc.html,
+# Inside: Xvfb + XFCE (1280x720), noVNC on http://localhost:6090/vnc.html,
 # and a resident agent worker (`serve`) on /tmp/computeruse.sock.
 
 FROM python:3.12-bookworm
