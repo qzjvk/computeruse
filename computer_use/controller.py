@@ -398,6 +398,11 @@ class Agent:
         if self.dry_run:
             print(f"    [action (dry-run)] open {arg!r} ({command})")
             return True
+        if self._focus_existing(class_tokens) is not None:
+            print(f"    [action] focus existing {command.split()[0]} window "
+                  f"(class {class_tokens})")
+            actions.pause(0.8)  # let the app settle before the next step types
+            return True
         before = _visible_window_ids()
         if actions.launch(command) is None:
             print(f"    [open] binary not found: {command.split()[0]!r}")
@@ -435,6 +440,39 @@ class Agent:
             time.sleep(tick)
         return False
 
+    def _focus_existing(self, class_tokens: tuple[str, ...]) -> Optional[str]:
+        """Activate a visible window matching ``class_tokens`` and return
+        its id, or None if the app has no window yet.
+
+        Attaching instead of launching matters where a second launch
+        opens a NEW window: a new Firefox window in a running session
+        shows the "Open previous tabs?" notification bar, which pushes
+        the page layout down ~35 px and breaks the results-band prior
+        (measured: the first result fell out of the band and the click
+        hit dead space). A fresh first window shows no such bar
+        (measured), so launching is still right when the app is not
+        running. With several windows, the active one wins, else the
+        largest (stray first-run windows are smaller than the
+        established geometry).
+        """
+        ids = [w for w in _xdotool("search", "--onlyvisible", "--name", ".").split()
+               if w.isdigit()
+               and any(t in _window_class(w).lower() for t in class_tokens)]
+        if not ids:
+            return None
+        active = _xdotool("getactivewindow")
+        if active in ids:
+            return active
+
+        def _area(w: str) -> int:
+            m = re.search(r"Geometry:\s*(\d+)x(\d+)",
+                          _xdotool("getwindowgeometry", w))
+            return int(m.group(1)) * int(m.group(2)) if m else 0
+
+        wid = max(ids, key=_area)
+        _xdotool("windowactivate", "--sync", wid)
+        return wid
+
     def _open_applications_menu(self, i: int) -> bool:
         """`open applications`: click the Applications button in the top
         menu bar. Reuses the deterministic top-strip path — the strip is
@@ -462,14 +500,19 @@ class Agent:
 
         Two gates, both measured (no fixed guess):
           1. title change — a navigation leaves the old title up until the
-             new document sets its own (0.05 s poll, 8 s cap)
+             new document sets its own (0.05 s poll, 8 s cap). A slow
+             page can set its title after the cap (measured: a heavy docs
+             page, ~10 s), so the gate also accepts a SETTLED frame
+             change: two consecutive captures that differ from the
+             pre-navigation frame (0.3 s poll) — the new page is up and
+             stable even if the title never arrives in time.
           2. render settle — the title is set BEFORE the new page paints
              (measured paint lag 0.44-1.1 s on DDG results), so gate 1
-             alone would let the next step act on the old page. After the
-             title change, poll captures (0.1 s poll, 3 s cap) until the
-             frame differs from the pre-navigation frame AND two
-             consecutive frames agree. Skipped when the title never
-             changed (nothing navigated).
+             alone would let the next step act on the old page. After
+             gate 1, poll captures (0.1 s poll, 3 s cap) until the frame
+             differs from the pre-navigation frame AND two consecutive
+             frames agree. Skipped when nothing changed at all
+             (nothing navigated).
         """
         if self.dry_run:
             print("    [action (dry-run)] wait-load")
@@ -481,13 +524,25 @@ class Agent:
         pre_cap = screen.capture(scope=self.scope,
                                  monitor_index=self.monitor).image
         t0 = time.time()
-        changed = False
+        outcome = "unchanged (cap)"
+        prev = None
+        next_frame = t0
         while time.time() - t0 < 8.0:
             if _xdotool("getwindowname", wid).strip() != pre:
-                changed = True
+                outcome = "title changed"
                 break
+            if time.time() >= next_frame:  # a slow page sets its title late
+                frame = screen.capture(scope=self.scope,
+                                       monitor_index=self.monitor).image
+                if (prev is not None
+                        and _frame_diff(prev, frame) <= _SETTLE_DIFF
+                        and _frame_diff(pre_cap, frame) > _SETTLE_DIFF):
+                    outcome = "page changed (title late)"
+                    break
+                prev = frame
+                next_frame = time.time() + 0.3
             time.sleep(0.05)
-        if changed:
+        if outcome != "unchanged (cap)":
             t1 = time.time()
             prev = None
             while time.time() - t1 < 3.0:
@@ -499,8 +554,7 @@ class Agent:
                     break  # new content, settled
                 prev = frame
                 time.sleep(0.1)
-        print(f"    [action] wait-load: title {'changed' if changed else 'unchanged (cap)'} "
-              f"after {time.time() - t0:.2f} s")
+        print(f"    [action] wait-load: {outcome} after {time.time() - t0:.2f} s")
         return True
 
     def _search(self, query: str, i: int) -> bool:
@@ -509,19 +563,32 @@ class Agent:
         The results page is opened for the agent to see — the top result
         is NOT resolved server-side (that would pick the answer without
         the agent ever looking at the results); a following click step
-        grounds and opens it. Flow: launch (or attach to the running
-        session, which opens a new window in its last-focused session
-        and focuses it) -> wait for the NEW firefox window to hold the
-        focus (new_only: typing before it exists loses keystrokes —
-        measured) -> Ctrl+L -> type the URL -> Return -> poll the
-        window title until the results page loads (the title changes
-        from 'New Tab' / the previous page to '<query> at DuckDuckGo'),
-        then poll until the results region actually renders (measured:
-        on DDG the title is set BEFORE the results paint, and the
-        render lag varied 0.44 s to >1.1 s across runs — a fixed
-        settle is a guess, so wait for real content instead of a
-        fixed pause). Ctrl+L is the universal "focus the address bar"
-        shortcut, so this works in any tab and any session state — the
+        grounds and opens it. Flow: attach to the running Firefox
+        window (launch only if none is running — a second launch opens
+        a NEW window, and a new window in a running session shows the
+        "Open previous tabs?" bar that shifts the results layout down
+        ~35 px and breaks the results-band prior, measured; a fresh
+        first window shows no such bar, measured) -> click the address
+        bar (a mouse click, not Ctrl+L: a page that auto-focuses its
+        own search box — DDG does — swallows the synthetic Ctrl+L and
+        the URL lands in the page's search box instead, measured
+        twice; the toolbar row sits at y≈33-68 of the window on every
+        browser at the established geometry) -> type the URL -> Return
+        -> poll the window title until the results page loads (the
+        title changes from the previous page to '<query> at DuckDuckGo'
+        ; if the tab already showed this exact search the title never
+        changes and the 8 s cap bounds the cost) -> poll until the
+        results region actually renders (measured: on DDG the title is
+        set BEFORE the results paint, and the render lag varied 0.44 s
+        to >1.1 s across runs — a fixed settle is a guess, so wait for
+        real content instead of a fixed pause) -> Escape + Home,
+        because a tab that already held a scroll position (a restored
+        session, a page scrolled by a previous run) carries that offset
+        into the new document (measured: a results page opened ~320 px
+        down, the first result cut out of the results band and the
+        click opening the wrong result); the results are read from the
+        top, so the page is returned to its top and re-polled. The
+        address-bar click works in any tab and any session state — the
         URL argument to the browser binary was measured unreliable (a
         fresh session taking over a stale profile drops it and shows
         New Tab). The URL is quote_plus-encoded, so every character
@@ -531,28 +598,79 @@ class Agent:
         if self.dry_run:
             print(f"    [action (dry-run)] search {query!r} -> {url}")
             return True
-        before = _visible_window_ids()
-        if actions.launch("firefox --no-sandbox") is None:
-            print("    [search] firefox binary not found")
+        wid = self._focus_existing(("firefox", "navigator"))
+        if wid is not None:
+            print(f"    [action] search {query!r}; using the running firefox window {wid}")
+        else:
+            before = _visible_window_ids()
+            if actions.launch("firefox --no-sandbox") is None:
+                print("    [search] firefox binary not found")
+                return False
+            print(f"    [action] search {query!r}; waiting for firefox to take focus")
+            if not self._wait_app_focus(("firefox", "navigator"), before,
+                                        timeout=15.0, tick=0.1, new_only=True):
+                print("    [search] firefox window did not take focus within 15 s")
+                return False
+            wid = _xdotool("getactivewindow")
+        pre = _xdotool("getwindowname", wid).strip()
+        actions.pause(0.2)  # let focus settle before typing
+        # A browser launched over a killed session opens the
+        # "Restore Session" interstitial (measured); its restore
+        # machinery races early navigations (the tab bounced back to
+        # the interstitial right after the results loaded — measured).
+        # "Start New Session" (fixed position on this fixed chrome page
+        # at the established geometry) clears it deterministically.
+        if "Restore Session" in pre:
+            print("    [search] Restore Session interstitial; "
+                  "starting a new session")
+            _xdotool("mousemove", "--window", wid, "737", "537")
+            _xdotool("click", "--window", wid, "1")
+            t0 = time.time()
+            while time.time() - t0 < 5.0:
+                if "Restore Session" not in _xdotool("getwindowname", wid).strip():
+                    break
+                time.sleep(0.1)
+            pre = _xdotool("getwindowname", wid).strip()
+            actions.pause(0.2)
+        # The address-bar sequence, verified: the title must come to
+        # contain "DuckDuckGo". A bare title change is not proof of a
+        # navigation (a transient restore attempt changes the title
+        # without loading anything — measured), and a focus race can
+        # eat the whole sequence, so verify and retry.
+        ok = False
+        for attempt in range(3):
+            # Focus the address bar with a mouse click, not Ctrl+L: a
+            # page that auto-focuses its own search box (DDG does)
+            # swallows the synthetic Ctrl+L and the URL lands in the
+            # page's search box instead (measured twice). The toolbar
+            # row sits at y≈33-68 of the window on every browser at the
+            # established geometry, so the window-center of that row is
+            # the address bar. A click in it selects the old URL, so
+            # the typed URL replaces it.
+            _xdotool("mousemove", "--window", wid, "640", "50")
+            _xdotool("click", "--window", wid, "1")
+            time.sleep(0.2)
+            _xdotool("type", "--window", wid, "--clearmodifiers", "--delay", "3", url)
+            _xdotool("key", "--window", wid, "Return")
+            t0 = time.time()
+            while time.time() - t0 < 8.0:
+                if "DuckDuckGo" in _xdotool("getwindowname", wid).strip():
+                    ok = True
+                    break
+                time.sleep(0.05)
+            if ok:
+                # catch a fast bounce (the restore machinery
+                # reasserting itself — measured once)
+                time.sleep(0.5)
+                if "DuckDuckGo" not in _xdotool("getwindowname", wid).strip():
+                    ok = False
+            if not ok:
+                print(f"    [search] results not up after attempt "
+                      f"{attempt + 1}; retrying the address bar")
+        if not ok:
+            print(f"    [search] the DuckDuckGo results page did not load "
+                  f"(title: {_xdotool('getwindowname', wid).strip()!r})")
             return False
-        print(f"    [action] search {query!r}; waiting for firefox to take focus")
-        if not self._wait_app_focus(("firefox", "navigator"), before,
-                                    timeout=15.0, tick=0.1, new_only=True):
-            print("    [search] firefox window did not take focus within 15 s")
-            return False
-        pre = _xdotool("getwindowname", _xdotool("getactivewindow")).strip()
-        actions.pause(0.1)  # let the new window's address bar settle
-        _xdotool("key", "ctrl+l")
-        _xdotool("type", "--clearmodifiers", "--delay", "3", url)
-        _xdotool("key", "Return")
-        # Measured load wait: the window title changes to
-        # "<query> at DuckDuckGo" when the results document loads.
-        t0 = time.time()
-        while time.time() - t0 < 8.0:
-            title = _xdotool("getwindowname", _xdotool("getactivewindow")).strip()
-            if title and title != pre and title not in ("New Tab", "Mozilla Firefox"):
-                break
-            time.sleep(0.05)
         # Measured: on DDG the title is set BEFORE the results render
         # (the render lag varied 0.44 s to >1.1 s across runs), so a
         # fixed settle is a guess. Poll until the first-result band
@@ -567,6 +685,30 @@ class Agent:
             # IndexError("image index out of range"). A too-small crop has
             # few/no dark pixels, so the poll just keeps going until the
             # window renders at full size.
+            x1, y1, x2, y2 = 120, 400, min(700, w), min(470, h)
+            px = cap.image.convert("L").load()
+            dark = sum(1 for y in range(y1, y2, 4)
+                       for x in range(x1, x2, 8) if px[x, y] < 150)
+            if dark > 20:
+                break
+            time.sleep(0.1)
+        # A tab that already held a scroll position (a restored session,
+        # a page scrolled by a previous run) carries that offset into
+        # the new document (measured: a results page opened ~320 px
+        # down, the first result cut out of the results band and the
+        # click opening the wrong result). The address bar still holds
+        # the focus after the Return: Escape drops it, Home scrolls the
+        # document to its top — the results are read from the top, so
+        # the results-band prior sees the first result again.
+        _xdotool("key", "--window", wid, "Escape")
+        _xdotool("key", "--window", wid, "Home")
+        time.sleep(0.3)
+        # the scroll repaints the band: confirm the first result is in
+        # it (same dark-pixel poll, short cap)
+        t2 = time.time()
+        while time.time() - t2 < 2.0:
+            cap = screen.capture(scope="window")
+            w, h = cap.image.size
             x1, y1, x2, y2 = 120, 400, min(700, w), min(470, h)
             px = cap.image.convert("L").load()
             dark = sum(1 for y in range(y1, y2, 4)
@@ -1043,6 +1185,19 @@ class Agent:
             why = self._degenerate(result, crop.size[0], crop.size[1], kind)
             if why is not None or result.center is None:
                 return None
+            # A single full-crop box is the model's "target not found in
+            # this crop" answer: its center is a blind guess (measured:
+            # on a layout-shifted results page the box pass returned the
+            # full crop and the trusted-band click hit dead space).
+            # Reject it so the caller tries the next pass.
+            if kind == "box" and len(result.boxes) == 1:
+                bx1, by1, bx2, by2 = result.boxes[0]
+                if (bx1 <= 2 and by1 <= 2
+                        and bx2 >= crop.size[0] - 2
+                        and by2 >= crop.size[1] - 2):
+                    print("    zoom answer: full-frame box = no target in "
+                          "the crop; trying the next pass")
+                    return None
             x, y = result.center
             s = _std_at(x, y)
             fx, fy = cx1 + x / factor, cy1 + y / factor

@@ -276,9 +276,9 @@ Steps are separated by `;` or newlines. A bare phrase is treated as `click`.
 | `key <combo>`         | key combo, e.g. `ctrl+alt+t`, `enter`    |
 | `scroll <phrase> <n>` | scroll at the element (positive = down, − = up). The target is grounded on a coarse pass (≤ 320 vision patches): a scroll target is a large region — the point only has to land inside it — so region-level accuracy at ~1/10 of a full-window pass |
 | `wait <seconds>`      | idle                                     |
-| `open <app>`          | tool step: launch/focus an app directly — `firefox`, `file manager`, `terminal`, `applications`. No grounding pass; the step returns only once the app's window has the focus, so a following `type`/`key` lands in it. Unknown apps fail loudly. |
-| `search <query>`      | tool step: open Firefox on a DuckDuckGo search for `<query>` (alias `duckduckgo <query>`). The results page is shown — the top result is *not* resolved server-side (that would pick the answer without the agent ever seeing the results); a following `click the first result in the search results` grounds and opens it. Flow: wait for the new Firefox window to take focus → Ctrl+L → type → Return → poll the window title until the results document loads, then poll until the results region has rendered (no fixed pauses). |
-| `wait-load`           | wait until a navigation's new page is painted. Two measured gates, no fixed guess: (1) the active window's title changes (50 ms poll, 8 s cap — a navigation leaves the old title up until the new document sets its own); (2) the screen settles on the new page (100 ms frame compares, 3 s cap) — the title is set *before* the paint (measured), so gate 1 alone would let the next step act on the old page |
+| `open <app>`          | tool step: focus an app directly — attach to its running window, launch only if none is running — `firefox`, `file manager`, `terminal`, `applications`. No grounding pass; the step returns only once the app's window has the focus, so a following `type`/`key` lands in it. Unknown apps fail loudly. |
+| `search <query>`      | tool step: open Firefox on a DuckDuckGo search for `<query>` (alias `duckduckgo <query>`). The results page is shown — the top result is *not* resolved server-side (that would pick the answer without the agent ever seeing the results); a following `click the first result in the search results` grounds and opens it. Flow: attach to the running Firefox window (launch only if none is running) → click the address bar (a mouse click — pages that auto-focus their own search box swallow a synthetic Ctrl+L, measured) → type → Return, sent by window id → verify the title actually becomes the DuckDuckGo title (a bare title change is not proof of navigation — measured), retrying up to 3× and failing loudly → poll until the results region has rendered → Escape+Home, because a tab that held a scroll position carries it into the new document (measured) (no fixed pauses). |
+| `wait-load`           | wait until a navigation's new page is painted. Two measured gates, no fixed guess: (1) the active window's title changes (50 ms poll, 8 s cap — a navigation leaves the old title up until the new document sets its own); a slow page can set its title after the cap (measured: a heavy docs page, ~10 s), so gate 1 also accepts a *settled* frame change — two consecutive captures differing from the pre-navigation frame (0.3 s poll); (2) the screen settles on the new page (100 ms frame compares, 3 s cap) — the title is set *before* the paint (measured), so gate 1 alone would let the next step act on the old page |
 | `done`                | stop                                     |
 
 The `open` tools exist because app launching is exactly where icon grounding
@@ -299,10 +299,10 @@ top result itself. The budget, per step:
 
 | Step | Cost | Why |
 |---|---|---|
-| `search <query>` | ~1.5–2.4 s | no model pass — launch Firefox (the running session opens a new window), wait for that new window to take focus (`new_only`: typing before it exists loses keystrokes — measured), Ctrl+L → type → Return, poll the window title until the results document loads, then poll until the results region actually renders (measured: on DDG the title is set *before* the paint; the render lag varied 0.44 s to >1.1 s across runs) |
+| `search <query>` | ~1.5–2.4 s (attach); ~4.5 s (cold launch) | no model pass — attach to the running Firefox window (launch only if none is running: a second launch opens a *new* window, and a new window in a running session shows the "Open previous tabs?" bar that shifts the results layout down ~35 px and breaks the results-band prior — measured), click the address bar (a mouse click, not Ctrl+L — DDG auto-focuses its search box and swallows the synthetic Ctrl+L, measured twice), type → Return sent by window id, verify the title becomes the DuckDuckGo title (a bare title change is not proof — a transient restore attempt changed it without a navigation, measured), retry up to 3× then fail loudly, then poll until the results region actually renders (measured: on DDG the title is set *before* the paint; the render lag varied 0.44 s to >1.1 s across runs) |
 | `wait 0.4` | 0.4 s | the task's own settle margin |
 | `click the first result in the search results` | ~2.8 s | the results-band prior crops the fixed band where the first organic result sits (left column below the search header; (0,384)–(768,496) of a 1280×620 window ≈ 432 patches) — one pass, no box pass. The model's box is trusted (everything in the band is part of the first result) and box-grounding is tried before point-grounding (a point wanders into the whitespace around the text; measured) |
-| `wait-load` | ~0.6–1.2 s | gate 1: poll the window title every 50 ms until the navigation sets a new one; gate 2: wait for the new page's paint to settle (100 ms frame compares) — measured overhead of gate 2: 0.02–0.25 s |
+| `wait-load` | ~0.6–1.2 s | gate 1: poll the window title every 50 ms until the navigation sets a new one (a slow page that sets its title after the 8 s cap is caught by a settled frame change instead — two consecutive frames differing from the pre-navigation capture); gate 2: wait for the new page's paint to settle (100 ms frame compares) — measured overhead of gate 2: 0.02–0.25 s |
 | `wait 0.9` | 0.9 s | the OneTrust wall renders ~0.93 s after the title change (measured on a fresh profile: the dialog appears in a single frame) |
 | `click … in the dialog` | ~2.2 s | the center-region prior crops a fixed box around the button zone of a centered modal ((448,240)–(896,410) ≈ 384 patches) — one pass, no box pass |
 
@@ -314,30 +314,34 @@ resolving the top result server-side from DuckDuckGo's JS-free `/html/`
 endpoint — but that step picked the answer without the agent ever looking
 at the results, so it was removed.
 
-**Measured: a complex multi-app task in ~12 s.** The 9-step task "search a
+**Measured: a complex multi-app task in ~13 s.** The 9-step task "search a
 topic, open the top result, scroll the article, open a terminal, write a note
-file, press enter" spans two applications and runs in **11.5–12.1 s** on the
-1070 (four fresh-container runs; wall clock, the task's own waits included).
-No task-specific shortcuts: every step is grounded from pixels. The budget of
-the 12.1 s run:
+file, press enter" spans two applications and runs in **12.5–15.1 s** on the
+1070 across the attach and launch paths (wall clock, the task's own waits
+included; earlier fresh-container runs took 11.5–12.1 s). No task-specific
+shortcuts: every step is grounded from pixels. The budget of the slowest
+verified run (launch path over a killed session whose restored tab carried a
+scroll position — the worst realistic state, 15.1 s):
 
 | Step | Cost | Why |
 |---|---|---|
-| `search <query>` | 1.64 s | no model pass — launch Firefox, wait for the new window's focus, type the query, wait for the results to render |
+| `search <query>` | 4.94 s | no model pass — cold launch of Firefox (restore, window map, focus) + address-bar sequence + DDG load + render poll + Escape+Home normalize |
 | `wait 0.4` | 0.40 s | the task's own settle margin |
-| `click the first result in the search results` | 2.60 s | the results-band prior — one pass |
-| `wait-load` | 1.20 s | the title changed 1.18 s after the click (cold caches on a fresh container); the settle gate adds 0.02 s |
-| `scroll the article 3` | 4.16 s | coarse grounding pass: the capture is downsampled to 300 vision patches (≤ 320) — a scroll target is a large region; the point only has to land inside it. ~30 s cheaper than the 4004-patch full-window pass; the full-res capture is still saved as evidence |
-| `open terminal` | 1.25 s | the `open` tool — no grounding pass; returns when the terminal window has the focus |
-| `type echo … > /root/note.txt` | 0.72 s | typed directly into the focused window |
+| `click the first result in the search results` | 3.01 s | the results-band prior — one pass |
+| `wait-load` | 1.11 s | the title changed 1.09 s after the click; the settle gate adds 0.02 s |
+| `scroll the article 3` | 3.96 s | coarse grounding pass: the capture is downsampled to 300 vision patches (≤ 320) — a scroll target is a large region; the point only has to land inside it. ~30 s cheaper than the 4004-patch full-window pass; the full-res capture is still saved as evidence |
+| `open terminal` | 0.95 s | the `open` tool — no grounding pass; attaches to the running terminal window |
+| `type echo … > /root/note.txt` | 0.71 s | typed directly into the focused window |
 | `key enter` | 0.01 s | — |
 
-Verified on each run: `/root/note.txt` contains the echoed line, and the
-article actually scrolled — the article region differs by 37–44 % of its
-pixels between the pre-scroll and post-scroll captures, and the "Solution:"
-section is visible in the final screenshot. (Before the two fixes below the
-same region differed by 0.02 %: the scroll had silently been a no-op.) The
-pixel diffs exposed two bugs:
+(Attach-path re-runs: 12.5–12.7 s — search is 1.5–2.4 s instead of 4.9 s.)
+Verified on each run: `/root/note.txt` contains the echoed line, the correct
+article is open (not the second or third result), and the article actually
+scrolled — the article region differs by 37–57 % of its pixels between the
+pre-scroll and post-scroll captures, and the "Solution:" section is visible in
+the final screenshot. (Before the fixes below the same region differed by
+0.02 %: the scroll had silently been a no-op.) The pixel diffs and the
+failed re-runs exposed five bugs:
 
 1. **Scroll sign.** pyautogui takes positive amounts as *up*; the task
    language "scroll 3" means down. With the old sign a scroll at the top of a
@@ -349,6 +353,43 @@ pixel diffs exposed two bugs:
    new page paints, so a scroll right after hit the old results page. The
    settle gate (gate 2 of `wait-load`) fixes this at a measured 0.02–0.25 s
    overhead.
+3. **A new window on re-run.** `search` always launched a second Firefox
+   instance; the new window it opened in the running session showed the
+   "Open previous tabs?" bar, which pushed the results layout down ~35 px and
+   put the first result out of the results band — the model then answered
+   with a full-crop box (its "not found" answer) and the trusted-band logic
+   clicked the crop center: dead space, no navigation (measured: `wait-load`
+   capped at 8 s and the task ran on the results page). Now `search` and
+   `open` attach to the running window (launch only if none is running — a
+   fresh first window shows no such bar, measured), and a single full-frame
+   box in the zoom pass is rejected as "no target in the crop" instead of
+   being clicked blindly.
+4. **Inherited scroll position.** A tab that already held a scroll position
+   (a restored session, a page scrolled by a previous run) carries that offset
+   into the newly loaded document — measured: the results page opened ~320 px
+   down (3 wheel notches), the first result cut out of the results band, and
+   the click opened result 3 instead of result 1. `search` now ends with
+   Escape + Home (Escape drops the address-bar focus, Home scrolls the
+   document to its top) plus a short re-poll of the results band; the
+   controlled repro (scrolled tab → search → capture) confirms the results
+   render at the top again.
+5. **The "Restore Session" interstitial.** Launching Firefox over a killed
+   session occasionally shows its restore-failure interstitial ("Sorry. We're
+   having trouble getting your pages back", with "Start New Session" /
+   "Restore Session" buttons) — observed once, with its early restore machinery
+   racing the first navigation: the typed results URL bounced back to the
+   interstitial right after loading (measured). `search` now proactively
+   clicks "Start New Session" (fixed position on this fixed-chrome page at the
+   established geometry) and then *verifies* that the title actually becomes
+   the DuckDuckGo title — a bare title change is not proof of a navigation
+   (the transient restore attempt changed the title without loading anything,
+   measured) — retrying the address-bar sequence up to 3× and failing loudly
+   if the results page never loads, instead of clicking a dead band. The
+   interstitial's trigger could not be reproduced on demand (controlled
+   session-file corruption at both the LZ4 and JSON level yields a logged
+   "No readable session files found to restore, starting with empty session"
+   instead — measured), so the verify+retry path is the general guard for
+   whatever startup state appears.
 
 ## GTX 1070 notes
 
