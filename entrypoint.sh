@@ -27,6 +27,34 @@ Xvfb :99 -screen 0 1280x720x24 -ac +extension GLX &
 
 sleep 3
 eval "$(dbus-launch --sh-syntax)"
+# AT-SPI accessibility bus: the `read` verb (computer_use/atspi.py) dumps
+# the rendered text of the active app from the OS accessibility tree —
+# the only content channel a text planner has (the vision model is
+# grounding, not VQA). GTK apps (Firefox, the terminal) expose their tree
+# only while org.a11y.Status IsEnabled is ON AT THEIR STARTUP, so the
+# launcher and the toggle must run BEFORE xfce4-session/firefox below.
+# The launcher registers org.a11y.Bus on the session bus (it then hands
+# out the private a11y bus address); the registry daemon is service-
+# activated on that bus on first use. The property toggle is the gdbus
+# one-liner (measured: Set returns (), Get reflects it).
+if command -v at-spi-bus-launcher >/dev/null 2>&1; then
+    at-spi-bus-launcher --launch-immediately &
+    for _ in $(seq 1 60); do
+        if gdbus call --session --dest org.a11y.Bus \
+                --object-path /org/a11y/bus \
+                --method org.freedesktop.DBus.Properties.Get \
+                org.a11y.Status IsEnabled >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.5
+    done
+    gdbus call --session --dest org.a11y.Bus --object-path /org/a11y/bus \
+        --method org.freedesktop.DBus.Properties.Set \
+        org.a11y.Status IsEnabled "<true>" \
+        || echo "[sandbox] warning: could not enable the a11y bus; the read verb will be dead"
+else
+    echo "[sandbox] warning: at-spi-bus-launcher missing (a11y apt packages not installed); the read verb will be dead"
+fi
 xfce4-session &
 firefox-esr --no-sandbox &
 

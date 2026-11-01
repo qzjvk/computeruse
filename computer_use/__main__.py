@@ -66,6 +66,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "0.2 lets a click settle. A task's own 'wait N' "
                         "(or 'wait-load') covers longer loads.")
     p.add_argument("--max-steps", type=int, default=32)
+    p.add_argument("--max-seconds", type=float, default=180.0,
+                   help="Wall-clock budget for an orchestrate run "
+                        "(default 180 s; research goals need more, e.g. "
+                        "900)")
+    p.add_argument("--planner-ctx", type=int, default=None,
+                   help="LFM3 planner context window for this run (e.g. "
+                        "8192 for research goals whose history carries "
+                        "read dumps; default 4096)")
     p.add_argument("--monitor", type=int, help="Monitor index for screenshots (default: mouse position)")
     p.add_argument("--save-dir", default="runs", help="Where to save step screenshots ('' to disable)")
     p.add_argument("--no-box-fallback", action="store_true",
@@ -106,6 +114,8 @@ def main(argv: list[str] | None = None) -> int:
             "scope": args.scope,
             "dry_run": args.dry_run, "delay": args.delay,
             "max_steps": args.max_steps, "monitor": args.monitor,
+            "max_seconds": args.max_seconds,
+            "planner_ctx": args.planner_ctx,
             "save_dir": args.save_dir or None,
             "box_fallback": not args.no_box_fallback,
         }
@@ -128,16 +138,19 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if resp["ok"] else 1
 
         from . import server
-        from .orchestrator import OrchestratedAgent, Planner
+        from .orchestrator import OrchestratedAgent, Planner, set_planner_ctx
 
         worker, scope = server.build_worker(args)
         planner = Planner()
+        if args.planner_ctx:
+            set_planner_ctx(args.planner_ctx)
         planner.ensure_server()
         ok = OrchestratedAgent(
             worker, planner, dry_run=args.dry_run, delay=args.delay,
             scope=scope, monitor=args.monitor,
             save_dir=args.save_dir or None,
             max_steps=args.max_steps,
+            max_seconds=args.max_seconds,
             box_fallback=not args.no_box_fallback,
         ).run(goal)
         return 0 if ok else 1

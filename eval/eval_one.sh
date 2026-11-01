@@ -14,17 +14,64 @@ for i in 1 2 3; do
   xdotool search --name "Terminal" windowclose 2>/dev/null; sleep 0.5
   [ -z "$(xdotool search --name "Terminal" 2>/dev/null)" ] && { ok_reset=1; break; }
 done
-# ctrl+l can drop while the WM focus settles after windowclose; the
-# keystrokes then land in the current page's search box (T2: "about:blank"
-# typed into the DDG box). Verify+retry the navigation instead.
+# The location bar is FOCUSED from the a11y tree on every attempt
+# (grab_focus on the node named/roled as the bar — its name varies
+# per search engine, 'Search with Google or enter address' /
+# 'Search with DuckDuckGo'), not clicked and not ctrl+l'd: the live
+# shared desktop moves/resizes the window (measured coordinates go
+# stale — a click from an old screenshot landed in the DDG search
+# box, which submitted "about:blank" as a query), a DDG page
+# auto-focuses its own search box and swallows synthetic keystrokes,
+# and a plain click on the bar can land on its globe icon and do
+# nothing (all measured). Verify window focus before typing (a focus
+# race sends the typing wherever the X input focus is). Fallback:
+# ctrl+l (works off DDG pages). Verify+retry.
 ok_nav=0
 for i in 1 2 3; do
-  xdotool search --name "Mozilla Firefox" windowactivate --sync 2>/dev/null
-  sleep 0.6
-  xdotool key ctrl+l 2>/dev/null; sleep 0.4
-  xdotool type "about:blank" 2>/dev/null; sleep 0.3
+  W=$(xdotool search --name "Mozilla Firefox" | head -1)
+  xdotool windowactivate --sync "$W" 2>/dev/null; sleep 0.6
+  [ "$(xdotool getactivewindow 2>/dev/null)" != "$W" ] \
+    && { xdotool windowactivate --sync "$W" 2>/dev/null; sleep 1; }
+  if ! timeout 20 /usr/bin/python3 -c "
+import gi; gi.require_version('Atspi', '2.0')
+from gi.repository import Atspi
+Atspi.init()
+d = Atspi.get_desktop(0)
+found = []
+def walk(a):
+    if a is None or found: return
+    try:
+        name = a.get_name() or ''
+        role = a.get_role_name() or ''
+    except Exception:
+        return
+    if role in ('combo box', 'entry', 'text') and (
+            'address' in name.lower() or 'enter' in name.lower()
+            or 'search with' in name.lower()
+            or 'location' in name.lower()):
+        found.append(a); return
+    try:
+        n = a.get_child_count()
+    except Exception:
+        n = 0
+    for i in range(min(n, 400)):
+        try:
+            walk(a.get_child_at_index(i))
+        except Exception:
+            pass
+for i in range(d.get_child_count()):
+    a = d.get_child_at_index(i)
+    if a and 'firefox' in (a.get_name() or '').lower():
+        walk(a)
+if found and found[0].grab_focus():
+    print('focus-ok')
+" 2>/dev/null | grep -q focus-ok; then
+    xdotool key ctrl+l 2>/dev/null; sleep 0.4
+  fi
+  xdotool key ctrl+a 2>/dev/null; sleep 0.2
+  xdotool type --clearmodifiers "about:blank" 2>/dev/null; sleep 0.3
   xdotool key Return 2>/dev/null; sleep 1.2
-  T=$(xdotool getactivewindow getwindowname 2>/dev/null)
+  T=$(xdotool getwindowname "$W" 2>/dev/null)
   [ "$T" = "Mozilla Firefox" ] && { ok_nav=1; break; }
 done
 [ $ok_nav = 1 ] || { echo "$ID: RESET-FAIL($T)"; exit 2; }
@@ -49,7 +96,7 @@ CUA_WAIT_SERVER=60 timeout 300 python -m computer_use \
   > "/tmp/eval_${ID}.log" 2>&1
 RC=$?
 
-STEPS=$(grep -cE '^\[orch\] step [0-9]+: (search|click|wait-load|scroll|open|type|key|done) ' "/tmp/eval_${ID}.log")
+STEPS=$(grep -cE '^\[orch\] step [0-9]+: (search|click|read|wait-load|scroll|open|type|key|done) ' "/tmp/eval_${ID}.log")
 PROTO=$(grep -c "protocol: executing" "/tmp/eval_${ID}.log")
 LOOP=$(grep -oE '\([0-9.]+ s total, [0-9]+ steps\)' "/tmp/eval_${ID}.log" | tail -1)
 AMT=$(grep -oE 'amount.: [0-9]+' "/tmp/eval_${ID}.log" | tail -1)

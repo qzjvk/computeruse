@@ -270,12 +270,17 @@ plans: **LiquidAI LFM3-1.7B** (Q4_K_M GGUF, served by llama.cpp's
 OpenAI-compatible `llama-server`) on the same GTX 1070, ~1.4 GB
 footprint. The LLM sees only **text** — the goal, and the reported
 result of each executed step (ok/fail, elapsed, frame-change %, active
-window title) — and each turn emits exactly ONE tool call from a closed
-vocabulary (the controller verbs plus `observe`/`verify`/`done`). The
-deterministic executor in `controller.py` is the only actor that touches
-the screen; grounding stays inside it. The LLM is never asked "what do
-you see" (LocateAnything is a grounding model, not VQA), so perception
-is the deterministic window-title + 320×180 frame-diff signal.
+window title, and — for `read` steps — the page's a11y-tree dump) — and
+each turn emits exactly ONE tool call from a closed vocabulary (the
+controller verbs plus `read`/`observe`/`verify`/`done`). The
+deterministic executor in `controller.py` is the only actor that
+touches the screen; grounding stays inside it. The LLM is never asked
+"what do you see" (LocateAnything is a grounding model, not VQA);
+perception is the deterministic window-title + 320×180 frame-diff
+signal, plus a **content channel** the LLM pulls when it needs the
+page's *text*: the `read` verb dumps the active app's AT-SPI
+accessibility tree — a measured, non-LLM source (see **Content
+channel** below).
 
 The planner is 1.7B, so the architecture compensates for measured
 weaknesses:
@@ -321,8 +326,9 @@ weaknesses:
   All of this was measured on the 9-task battery below, not on one ad-hoc
   goal.
 - **Caps:** 32 steps (overridable with `--max-steps` — the T9
-  17-command goal runs with a 48 cap), 180 s, 3 consecutive failures
-  (blocked repeats count).
+  17-command goal runs with a 48 cap, the T10 research goal with
+  64), 180 s (overridable with `--max-seconds` — T10 runs with 900),
+  3 consecutive failures (blocked repeats count).
 
 The server is spawned at orchestrate start and stopped at the end. The
 spawn pins the 1070 **alone** via `CUDA_VISIBLE_DEVICES`: llama.cpp's
@@ -350,16 +356,138 @@ docker exec cuasandbox bash -lc \
 Knobs: `LFM3_URL`/`LFM3_PORT` (attach to an existing server),
 `LFM3_MODEL`, `LFM3_BIN`, `LFM3_GPU` (default: the device named *1070*),
 `LFM3_PERSIST`, `LFM3_CTX` (4096), `LFM3_MAX_TOKENS` (256),
-`LFM3_TEMPERATURE` (0.1), `LFM3_TOP_K` (50); `CUA_WAIT_SERVER=<s>` makes
-the client wait for the worker socket. Sampling: temp 0.1, top-k 50,
-thinking disabled, `tool_choice: required`.
+`LFM3_TEMPERATURE` (0.1), `LFM3_TOP_K` (50); CLI flags for long runs:
+`--max-seconds` (default 180) and `--planner-ctx` (default 4096 —
+when it differs from the running server's context window the server
+is respawned with it; verified live on the 1070 with 8192, which
+carries the research goal's growing dump history);
+`CUA_WAIT_SERVER=<s>` makes the client wait for the worker socket.
+Sampling: temp 0.1, top-k 50, thinking disabled, `tool_choice:
+required`.
+
+**Content channel (`read`): page text is measured, not described.**
+Open-ended goals ("find the cheapest X in the Portuguese market")
+need the page's *content* — prices, product names, which source is
+which — and neither the frame-diff nor the title carries that. The
+`read` verb dumps the active app's AT-SPI accessibility tree
+(`computer_use/atspi.py`, pyatspi via `gi.repository.ATspi`): the
+window title, the page's numbered result/link list (names verbatim
+— on a DDG results page they are the page titles), a page-text
+excerpt, a `money:` line (price tokens — `501€ | 681€ | 680,49€` —
+the currency-token scan that lets the planner *compare* prices
+without arithmetic), and a links line. The dump lands in the step's
+history line, so the planner's next turn sees the measured content.
+Cost: ~0.1–0.4 s; an 8 s hard timeout + node budget means a hung
+tree can't stall the run. The a11y bus is persistent in the image:
+`entrypoint.sh` starts `at-spi-bus-launcher --launch-immediately`
+and sets `org.a11y.Status.IsEnabled=true` via gdbus *before*
+xfce4-session and Firefox come up (guarded — it warns on images
+rebuilt without the packages), and the Dockerfile ships
+`at-spi2-core`, `libatk-bridge2.0-0`, `python3-gi`,
+`gir1.2-atspi-2.0`, `python3-dbus`. Two measured quirks: (1) the
+tree builds lazily right after a navigation — the first `read` can
+return the title only; the machine detects the degraded dump and
+re-reads (the per-state repeat guard bounds that); (2) consent
+modals (OLX, KuantoKusta) block *navigation* — clicks are swallowed
+by the dimmed overlay, Back is dead — but not *content*: the dump
+carries the page's text and prices behind the modal, which is why
+the research machine reads first and escapes through the address-bar
+search (below).
+
+**Research goals: open-ended long runs.** Goals that ask for a
+*result* (a price, a comparison) rather than a *page* run a
+different machine, gated on `_wants_a_specific_result(goal)`:
+specific-result goals ("open the first result") keep the fast path
+verbatim, so the T1–T9 battery is untouched by this machinery.
+Long-run knobs: `--max-steps 64 --max-seconds 900 --planner-ctx
+8192` (the history grows with every dump). `done` is no longer
+machine-executed: once every subgoal is marked, the PLANNER gets
+the final turn — its summary is the deliverable (the report: the
+facts found, the sources, the prices); after two non-done planner
+turns the machine executes the auto-done anyway (termination
+guarantee). The report's facts never depend on the planner: the
+done HINT carries them, and the mechanical auto-done is built from
+them — `_research_facts()` assembles the measured evidence from the
+run's own read dumps (every distinct source page read: its title +
+the dump's `money:` line, plus the min over those price tokens as
+"cheapest price seen" — every line a measured dump, no LLM in it;
+measured: without the facts in the prompt/fallback the run ended
+on the mechanical checklist parrot with zero facts). Counted source
+subgoals ("at least three Portuguese sources") mark only at N
+distinct source pages READ — not merely visited (measured: the
+T10 run — the third source was opened, all_done fired before its
+read, and the report had no price for it); after every research
+step the prompt carries a `PROGRESS:` line (distinct sources
+opened + their titles + what the goal asks for), because the 1.7B
+re-reads the same dump and re-opens the same first result unless
+the history tells it what it has already opened.
+
+The deterministic post-step state machine (each branch fires on a
+measured state signature, never on the planner's claims):
+
+| Measured state (research goal) | Machine's response |
+|---|---|
+| wait-load/click lands on a **new** source page | `read` (the dump carries the page's text + prices) |
+| lands on a **visited** source page (revisit) | `ctrl+Left` + a hint naming the opened sources AND the unopened results from the last read dump |
+| **no-op click** on a source page (dead space / consent-dialog overlay) | `read` (the content channel works behind the modal — measured) |
+| **dead key** (Back) on a source page | `wait-load` (disambiguates an async navigation from dead) |
+| wait-load **still stuck** on the source page | `search` with the goal's own query — the address bar bypasses the dialog (measured escape: the KuantoKusta modal, two dead `ctrl+Left`, the search recovered) |
+| `read` on the results page returns **title only** (lazy a11y tree) | re-`read` (bounded by the per-state repeat guard) |
+| `read` on the results page with a **full dump** (research goal) | **the machine clicks the first unopened result** — the 1.7B fixates on the first result even when the unopened names are hinted (measured: six revisits of the same two sources after two distinct; the step budget died on revisits, not on navigation), so the pick is machine-executed, in list order from the measured dump |
+| planner clicks a phrase that is **exactly a key combo** | executed as `key` (the 1.7B echoes the hint's key JSON — measured: 31 s of grounding for "ctrl+Left") |
+| planner clicks a **result number** ("1.") | resolved to the full result name from the last good read dump; re-read if no dump with a list is on hand (the degraded-dump fallback that left it with no names — measured: five 36 s clicks of "1.") |
+
+The repeat guard's retry count is **per-state**: `attempts[key]`
+resets when the step's saved (title, frame) no longer matches the
+pre-step state — a global count blocked the research chain's own
+re-reads/re-searches of the results page once a few had run
+(measured: the T10 run, steps 18/25/30–32 "repeated" FAILED).
+`_last_dump` keeps only a DDG dump that actually carries the
+numbered list, so the revisit hints and the number resolution
+always resolve against a real results page, never against a
+degraded title or a source page's list items.
+
+**Measured: T10 — an open-ended research goal.** "Find the
+cheapest RTX 3060 available in the Portuguese market … pick at
+least 3 Portuguese sources from it. Open the sources one by one
+(… read the page; return …). Compare the prices you see. Call
+done with a summary that reports the cheapest RTX 3060 you found,
+its price, and every source you checked with the price you saw
+there." Run with `--max-steps 64 --max-seconds 900 --planner-ctx
+8192`. Final code, 2026-11-01, GTX 1070 shared desktop (re-run
+after the counted-source gate fix below — same shape, same step
+count): **21 steps / 140.7 s, EXIT=0, 3 distinct Portuguese
+sources opened AND read** (KuantoKusta, OLX anúncios, OLX
+Tecnologia) — the read-based mark is what forced the third read
+before done. The dead-Back consent-modal escape (goal-derived
+search through the address bar) fired twice; the machine picked
+every source from the measured dump. LFM3 calls: decompose, the
+first search, and the planner's ignored done hint (its
+non-done answer — a re-search — then the mechanical done) —
+everything else (18 of 21 steps) machine-executed from measured
+state signatures. The done summary IS the report — the
+mechanical fallback, built from the measured dumps, not an LLM
+judgment:
+
+> done: sources checked: Placas Gráficas | GeForce RTX 3060 - 12
+> GB | KuantoKusta: 501€ | 681€ | 680,49€; rtx 3060 - anúncios
+> classificados | OLX Portugal: 899 € | 990 € | 700 € | 200 € |
+> … | 679 €; placas rtx 3060 - Tecnologia e Informatica | OLX
+> Portugal: 899 € | 990 € | … | 450 € — cheapest price seen:
+> 75 € (on rtx 3060 - anúncios classificados | OLX Portugal)
+
+The "cheapest" line is the min over the measured `money:` tokens
+(the OLX list page carries many ad prices; the per-source lines
+carry the full context) — the user sees the facts + sources, and
+every one of them is in a read dump in the trace.
 
 Measured on the 1070: the 9-step goal (search → open first result →
 scroll 3 → open terminal → type a verbatim `echo … > /root/note.txt` →
-Enter) completes in **8 steps / 17–20 s loop, 1 planner call** (search is
-the only planning turn — every canonical transition is fast-path
-executed; ~22 s cold including the ~2.7 s LFM3 spawn), with the exact
-file content + fresh mtime and the article still in the tab. The
+Enter) completes in **9 steps / 22–29 s loop, 2 planner calls** (the
+step-1 search and the final done turn — every canonical transition in
+between is fast-path executed; T7's 45 s includes the cold Firefox
+launch), with the exact file content + fresh mtime and the article
+opened and scrolled in the run. The
 wait-load catches the slow-navigation quirk mid-flight at 1.0–1.2 s
 (pre-capture title == post-capture title means the navigation is still
 in flight); when the title already moved within the 0.2 s post-capture
@@ -382,10 +510,63 @@ docker exec cuasandbox bash -lc '
     xdotool search --name "Terminal" windowclose 2>/dev/null; sleep 0.5
     [ -z "$(xdotool search --name "Terminal")" ] && break
   done
-  xdotool search --name "Mozilla Firefox" windowactivate --sync
-  sleep 0.4; xdotool key ctrl+l; sleep 0.3
-  xdotool type "about:blank"; sleep 0.3; xdotool key Return; sleep 1.2
-  t=$(xdotool getactivewindow getwindowname)
+  W=$(xdotool search --name "Mozilla Firefox" | head -1)
+  xdotool windowactivate --sync "$W"; sleep 0.8
+  # Verify focus BEFORE sending keys: the desktop is shared/live, and
+  # a focus race sends the typing to whatever holds the X input focus
+  [ "$(xdotool getactivewindow)" = "$W" ] || { xdotool windowactivate --sync "$W"; sleep 1; }
+  # The location bar is FOCUSED from the a11y tree, not clicked: the
+  # window is moved/resized by the user on the live desktop (measured
+  # coordinates go stale — a click from an old screenshot landed in
+  # the DDG search box, which then submitted "about:blank" as a
+  # query), a DDG page auto-focuses its own search box and swallows
+  # synthetic keystrokes, and a plain click on the bar can land on
+  # its globe icon and do nothing (all measured). The bar node is
+  # found by name/role (its name varies per search engine — "Search
+  # with Google or enter address", "Search with DuckDuckGo") and
+  # grab_focus() sets the X input focus programmatically:
+  timeout 20 /usr/bin/python3 -c "
+import gi; gi.require_version(\"Atspi\", \"2.0\")
+from gi.repository import Atspi
+Atspi.init()
+d = Atspi.get_desktop(0)
+found = []
+def walk(a):
+    if a is None or found: return
+    try:
+        name = a.get_name() or \"\"
+        role = a.get_role_name() or \"\"
+    except Exception:
+        return
+    if role in (\"combo box\", \"entry\", \"text\") and (
+            \"address\" in name.lower() or \"enter\" in name.lower()
+            or \"search with\" in name.lower()
+            or \"location\" in name.lower()):
+        found.append(a); return
+    try:
+        n = a.get_child_count()
+    except Exception:
+        n = 0
+    for i in range(min(n, 400)):
+        try:
+            walk(a.get_child_at_index(i))
+        except Exception:
+            pass
+for i in range(d.get_child_count()):
+    a = d.get_child_at_index(i)
+    if a and \"firefox\" in (a.get_name() or \"\").lower():
+        walk(a)
+if found and found[0].grab_focus():
+    print(\"focus-ok\")
+" || true
+  # ...and if that failed, Ctrl+L (it works off DDG pages). Typing
+  # goes to the X input focus (the bar grab_focus just set), not
+  # --window (the bar is a child widget; XSendEvent to the parent is
+  # dropped):
+  xdotool key ctrl+a; sleep 0.3
+  xdotool type --clearmodifiers "about:blank"; sleep 0.5
+  xdotool key Return; sleep 3
+  t=$(xdotool getwindowname "$W")
   [ "$t" = "Mozilla Firefox" ] && echo "desktop clean" || echo "RESET FAILED: $t"'
 ```
 
@@ -405,27 +586,35 @@ docker exec cuasandbox bash -lc '
  driver: `eval/eval_one.sh` (verify-and-retry reset, per-task setup,
  optional `--max-steps`, evidence summary).
 
- Final code, one run per task, 2026-11-01, GTX 1070 shared desktop:
+ Final code, one run per task, 2026-11-01 (re-run after the
+ decomposer-garbage + counted-gate fixes below), GTX 1070 shared
+ desktop:
 
  | Task | Setup twist | Steps | Loop | Planner calls | Evidence (file / tab) |
  |------|-------------|-------|------|---------------|------------------------|
- | T1 | — | 8 | 27.4 s | 1 | `T1: k8s gpu plugin docs` / GitHub k8s-device-plugin |
- | T2 | — | 7 | 20.6 s | 1 | `hello world 123` / GeeksforGeeks disk-space |
- | T3 | no terminal, no file | 4 | 18.2 s | 1 | (none) / CUDA Runtime API docs; 0 terminal procs |
- | T4 | single+double quotes in file | 8 | 13.7 s | 1 | `T4: single and "double" quotes ok` / Stack Overflow nvidia-runtime |
- | T5 | two commands, one 2-line file | 10 | 16.4 s | 1 | exactly `first-line`⏎`second-line` / NVIDIA Enterprise Portal |
- | T6 | terminal pre-opened | 8 | 24.2 s | 1 | `T6: attach existing terminal` / GitHub k8s-device-plugin |
- | T7 | Firefox killed (cold launch) | 8 | 36.3 s | 1 | `T7: cold launch ok` / GitHub k8s-device-plugin |
- | T8 | DDG preloaded with unrelated results | 7 | 19.3 s | 1 | `T8: preloaded results replaced` / GeeksforGeeks disk-space |
- | T9 | 17 commands, one 17-line file; 48-step cap | 40 | 29.9 s | 1 | `/root/pool.conf` all 17 lines exact / GitHub k8s-device-plugin |
+ | T1 | — | 9 | 22.6 s | 2 | `T1: k8s gpu plugin docs` / GitHub k8s-device-plugin |
+ | T2 | — | 8 | 24.8 s | 2 | `hello world 123` / results page (article opened + scrolled; the final re-search is the planner's ignored done hint) |
+ | T3 | no terminal, no file | 4 | 24.1 s | 2 | (none) / CUDA Runtime API docs; 0 terminal procs |
+ | T4 | single+double quotes in file | 8 | 24.7 s | 2 | `T4: single and "double" quotes ok` / Docker GPU docs |
+ | T5 | two commands, one 2-line file | 11 | 22.8 s | 2 | exactly `first-line`⏎`second-line` / results page (article opened + scrolled) |
+ | T6 | terminal pre-opened | 9 | 25.9 s | 2 | `T6: attach existing terminal` / GitHub k8s-device-plugin |
+ | T7 | Firefox killed (cold launch) | 8 | 45.2 s | 2 | `T7: cold launch ok` / GitHub k8s-device-plugin |
+ | T8 | DDG preloaded with unrelated results | 8 | 28.4 s | 2 | `T8: preloaded results replaced` / results page |
+ | T9 | 17 commands, one 17-line file; 48-step cap | 41 | 35.0 s | 2 | `/root/pool.conf` all 17 lines exact / results page |
 
- 9/9 pass; every run `exit=0`, `failed_lines=0`, and **1 planner call**
- (the decompose — the whole loop, including the done, is fast-path).
- Loop time is dominated by the two grounding passes (search 3.7–6.1 s,
- click 2.5–7.9 s); everything else is sub-2 s. T3 is 4 steps because the
- goal has no scroll/terminal half. T5 is 10 steps because the goal has
- two type+Enter pairs. T9 is 40 steps: the 3-step preamble (search,
- click, scroll), 17 type+Enter pairs, and the done — the decompose's
+ 9/9 pass; every run `exit=0`, `failed_lines=0`, and **2 in-loop
+ planner steps** (the step-1 search and the final done turn — the
+ decompose is a separate non-step LFM3 call; the canonical transitions
+ in between are fast-path). In this re-run the 1.7B ignored the done
+ hint in every task (a measured weakness under the new done-turn
+ design), so each ended on the mechanical fallback: the done summary
+ is the checklist, the termination guarantee fired, and the work was
+ fully done (file + tab evidence). Loop time is dominated by the two
+ grounding passes (search 3.8–6.2 s, click 2.5–7.9 s); everything else
+ is sub-2 s. T3 is 4 steps because the goal has no scroll/terminal
+ half. T5 is 11 steps because the goal has two type+Enter pairs. T9 is
+ 41 steps: search, click, wait-load, scroll, open, 17 type+Enter pairs,
+ the re-search (ignored done hint), and the done — the decompose's
  checklist cap and output budget are sized to the goal's command count
  (a fixed 8-line checklist / 300-token budget would have truncated the
  17-command goal and fired all_done before every command was typed).
@@ -499,6 +688,25 @@ docker exec cuasandbox bash -lc '
    history between each command's ok type step and the next command's
    type step (unbounded for the last). Measured steps only — never the
    planner's claims.
+  - **Decomposer meta-prose parked a subgoal in the counted-source
+    branch** (battery re-run, T2/T4/T6): the 1.7B reasoned out loud
+    inside a subgoal line — "…two lines? Or scroll within page…",
+    "…scroll to third page…" — and the loose counted-source gate
+    (a 6-word number window + a substring source keyword) owned the
+    line: the branch parks a subgoal until N distinct source pages are
+    READ, so the mark never fired, all_done never fired, no done hint
+    ever appeared, and the run burned its 32-step cap re-doing a chain
+    it had already completed (file written — `FILE-OK` — but exit=1).
+    Fixed in two layers: (a) decompose now drops meta-prose and
+    token-truncated lines (`_subgoal_garbage_reason` — self-referential
+    phrases like "i.e." / "we need to" / "the goal says", and lines
+    with unbalanced parens/quotes/backticks from a mid-line token
+    cut-off); (b) the counted branch's gate is the strict
+    counted-source signature (`_counted_sources` — a number within 3
+    words of a source noun AND an opening verb), so a line that merely
+    mentions a page falls through to its own action branch instead of
+    parking. T10 re-verified after the fix: same 21 steps, counted
+    subgoal marks on 3 READ sources.
 
  Re-run the battery from the sandbox (each task ~20–30 s):
 

@@ -25,6 +25,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         dbus dbus-x11 \
         xdotool \
         firefox-esr \
+        # AT-SPI accessibility stack: the `read` verb (computer_use/atspi.py)
+        # dumps the rendered text of the active app from the a11y tree —
+        # the only page-CONTENT channel a text planner has. at-spi2-core
+        # provides the bus launcher, libatk-bridge2.0-0 makes GTK apps
+        # (Firefox, the terminal) export their tree, python3-gi +
+        # gir1.2-atspi-2.0 let /usr/bin/python3 (distro python, which the
+        # worker's /usr/local python lacks) drive the tree, python3-dbus
+        # is the low-level fallback. The entrypoint starts the bus and
+        # toggles org.a11y.Status IsEnabled ON before any app starts
+        # (apps read it at startup).
+        at-spi2-core \
+        libatk-bridge2.0-0 \
+        python3-gi \
+        gir1.2-atspi-2.0 \
+        python3-dbus \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

@@ -116,8 +116,10 @@ class _Handler(socketserver.StreamRequestHandler):
                     # LLM planning over the same worker: the planner
                     # (LFM3, its own GPU share) picks the next step;
                     # this worker does all the pixel-level work.
-                    from .orchestrator import OrchestratedAgent, Planner
+                    from .orchestrator import OrchestratedAgent, Planner, set_planner_ctx
 
+                    if req.get("planner_ctx"):
+                        set_planner_ctx(int(req["planner_ctx"]))
                     planner = Planner()
                     planner.ensure_server()
                     ok = OrchestratedAgent(

@@ -21,11 +21,13 @@ Division of labor:
                        high-level results, never their internals.
   * the orchestrator — deterministic state for the planner: each step
                        result carries the active title and a frame-change
-                       % (320x180 gray diff), and observe/verify report
-                       window-manager state (active title + visible
-                       windows). Page CONTENT is not visible to a text
-                       planner by design — the title and the frame diff
-                       are the evidence channel.
+                        % (320x180 gray diff), observe/verify report
+                        window-manager state, and the `read` verb
+                        closes the content gap: the OS accessibility
+                        tree (atspi.py) dumps the rendered text,
+                        prices and links of the current window, so a
+                        text planner can see page content (measured,
+                        non-LLM source).
 
 Suggestion fast-path (the latency design): after a measured state
 signature (results page up, page settled, terminal focused) the
@@ -147,6 +149,17 @@ _TOOLS = [
                        "page is up (title changes and the frame settles).",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
+        "name": "read",
+        "description": "Dump the rendered text of the current window from "
+                        "the OS accessibility tree: page title, search "
+                        "results (title + URL each), body text, a "
+                        "'money:' line of prices, and link names. This is "
+                        "the ONLY way to see page CONTENT (titles and "
+                        "frame-diff cannot). Use it after any navigation "
+                        "or whenever the goal needs facts from the page. "
+                        "It changes nothing on screen.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
         "name": "observe",
         "description": "Report the current window state: the active window "
                        "title plus the list of visible windows. Use when "
@@ -208,6 +221,22 @@ _SYSTEM = (
     "subgoal; never redo a done subgoal or repeat its steps.\n"
     "- Call done only when the LAST subgoal is visibly achieved; state "
     "the evidence for it in the summary.\n"
+    "Content and research:\n"
+    "- read is the only way to see page CONTENT (window titles and the "
+    "frame-diff cannot). After a navigation that should show content "
+    "(a search results page, an article, a product page), the next step "
+    "is usually read. Its output (title, results with URLs, body text, "
+    "a 'money:' line of prices, link names) is carried in the history — "
+    "use it as facts; do not re-read an unchanged page.\n"
+    "- For comparison/research goals: search, read the results, open the "
+    "promising sources ONE BY ONE (click a result, wait-load, read), and "
+    "keep every fact with its source (e.g. 'OLX: ASUS RTX 3060 12GB 650 "
+    "euro') in your memory across steps. Return to the results list with "
+    "key ctrl+Left (browser Back); a new search is fine too. Compare "
+    "across at least as many sources as the goal names before deciding.\n"
+    "- For such goals the done summary IS the deliverable: state the "
+    "answer with every compared fact and its source name, not just that "
+    "you finished.\n"
     "Examples:\n"
     "History: step 1: search({\"query\": \"nvidia driver\"}) -> ok; "
     "title: 'nvidia driver at DuckDuckGo — Mozilla Firefox'; HINT: search "
@@ -226,6 +255,29 @@ _SYSTEM = (
 
 class PlannerError(RuntimeError):
     """The planner produced no usable step (transport or format)."""
+
+
+def set_planner_ctx(ctx: int) -> None:
+    """Point the next planner spawn at this context window.
+
+    A running server keeps its own ctx (llama-server is spawned once
+    and reused via health), so if one is already up it is killed first:
+    the next ensure_server respawns it with LFM3_CTX set. Needed for
+    research runs whose history carries read dumps (8192) on top of
+    the default 4096.
+    """
+    os.environ["LFM3_CTX"] = str(ctx)
+    port = os.environ.get("LFM3_PORT", "8090")
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health",
+                                    timeout=2):
+            pass
+    except Exception:
+        return  # nothing up: nothing to restart
+    # The caller's own cmdline never contains 'llama-server', so the
+    # pattern cannot hit us.
+    subprocess.run(["pkill", "-f", "llama-server"], capture_output=True)
+    time.sleep(1.0)
 
 
 # Keywords that put a subgoal on the mark surface (see _mark_subgoals):
@@ -258,6 +310,45 @@ def _subgoal_markable(sub: str) -> bool:
     # article/page.
     return bool(re.search(r"\b(verify|check|confirm)\b", s)
                 and re.search(r"\b(article|page)\b", s))
+
+
+# Decomposer meta prose: the 1.7B reasons out loud INSIDE a subgoal
+# line instead of writing the action (measured: the 2026-11-01
+# battery re-run — 'This is ambiguous but we need to treat as an
+# action: maybe use a tool like browser scroll', 'We'll assume we
+# need to get the content', 'But we are told "Only the goal's own
+# actions…"'). Any such line is commentary, not an atomic action.
+_META_PROSE_RE = re.compile(
+    r"(i\.e\.|this is ambiguous|we need to|we cannot|we can't|"
+    r"we are told|we'?ll assume|the goal says|maybe use|perhaps|"
+    r"one action|another action)", re.I)
+
+
+def _subgoal_garbage_reason(sub: str) -> str | None:
+    """Why a decompose line is decomposer garbage — None when it is a
+    usable atomic action.
+
+    A garbage line left in the checklist blocks all_done: it either
+    can never be marked (meta prose carries no action) or misfires
+    the mark logic on its stray words (measured: '…two lines? or
+    scroll within page…' parked a scroll subgoal in the
+    counted-source branch, which waits for READ source pages the task
+    never reads — the run then burned its step budget re-doing a
+    chain it had already completed). Two measurable signatures:
+    self-referential commentary, and a line cut off mid-token by the
+    decode's token budget (unbalanced parens/quotes/backticks —
+    measured: 'In terminal, run `echo "T6: attach'). Dropping loses
+    nothing the machine needs: the goal's full text stays in every
+    prompt, the canonical chain still performs the action, and the
+    command-coverage check re-adds a dropped command line.
+    """
+    m = _META_PROSE_RE.search(sub)
+    if m:
+        return f"meta prose {m.group(0)!r}"
+    if (sub.count("(") != sub.count(")") or sub.count("`") % 2
+            or sub.count('"') % 2):
+        return "truncated mid-line"
+    return None
 
 
 def _is_done_directive(s: str) -> bool:
@@ -464,6 +555,245 @@ def _goal_commands_run(goal: str, history: list[str], typed: list[str]) -> bool:
                    for en in enter_nos):
             return False
     return True
+
+
+def _wants_a_specific_result(goal_block: str) -> bool:
+    """Does the goal ask to open ONE specific result — 'the first
+    result', 'the top result', 'the result' — vs. research/comparison
+    goals that want SEVERAL sources read one by one?
+
+    Only the former may take the fast-path suggestion 'click the first
+    result after a search'. A research goal must READ the results page
+    first (the planner's prior does that); pre-empting it with a click
+    skips the read and ends the run on one unexamined page (measured:
+    the smoke run — search, click result 2, wait-load, done in 13 s,
+    no facts collected).
+    """
+    return bool(re.search(
+        r"\b(first|top|best)\b[^.\n]{0,40}\bresults?|\bthe result\b",
+        goal_block, re.I))
+
+
+# "open at least 3 Portuguese sources": the count the subgoal itself
+# names (goal-derived; the fast path already works this way — scroll
+# counts, quoted commands). N is a digit or a word number (the
+# decomposer writes 'three' — measured: the T10 run) and adjectives may
+# sit between it and the noun ('three Portuguese sources'), so scan a
+# small window before the noun. N=0 is NOT a counted subgoal; the plain
+# mark branches handle it.
+_COUNT_NOUN_RE = re.compile(
+    r"\b(?:sources?|results?|pages?|sites?|links?|websites?|stores?)")
+_WORD_NUMS = {
+    "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9, "ten": 10,
+    "dois": 2, "três": 3, "tres": 3, "quatro": 4, "cinco": 5,
+    "seis": 6, "sete": 7, "oito": 8, "nove": 9, "dez": 10,
+}
+
+
+def _counted_open(s: str) -> int:
+    # Every noun occurrence is checked (a subgoal can carry an
+    # UNcounted noun plus the counted one — 'read the results page
+    # and pick at least three sources': 'results' has no number in
+    # its window, 'sources' does — measured: the T10 run), and the
+    # max wins.
+    best = 0
+    for m in _COUNT_NOUN_RE.finditer(s):
+        for tok in s[:m.start()].split()[-6:]:
+            tok = tok.strip(".,;:'\"()").lower()
+            if tok.isdigit():
+                best = max(best, int(tok))
+                break
+            if tok in _WORD_NUMS:
+                best = max(best, _WORD_NUMS[tok])
+                break
+    return best
+
+
+_SOURCE_OPEN_VERB_RE = re.compile(
+    r"\b(open|visit|read|pick|search|browse|check|identify|find|look)\b",
+    re.I)
+
+
+def _counted_sources(s: str) -> int:
+    """The number a counted-source subgoal asks for — 0 when the
+    subgoal is not one.
+
+    The counted branch parks a subgoal until N distinct source pages
+    are READ, so its entry condition must be the counted-source
+    signature and nothing else. Two measured misfires parked other
+    actions forever (battery re-run 2026-11-01: T2/T4/T6 burned their
+    step budgets re-doing a chain they had already completed, because
+    the branch owned their scroll subgoals): the 1.7B's meta prose
+    '…two lines? or scroll within page…' (a loose 6-word number
+    window caught 'two' for 'page'), and '…scroll to third page…'
+    (caught 'third'). So the signature needs (a) a number bound to a
+    source noun — within 3 words, close enough to count THAT noun
+    ('three Portuguese sources'), far enough from a stray 'within
+    page' — and (b) an opening verb, because the branch waits for
+    opened/read sources: a scroll that merely mentions a page opens
+    nothing. 'Identify at least three Portuguese sources' and 'pick
+    3 results' pass both; the garbage fails one and falls through to
+    its own action branch.
+    """
+    if not _SOURCE_OPEN_VERB_RE.search(s):
+        return 0
+    best = 0
+    for m in _COUNT_NOUN_RE.finditer(s):
+        for tok in s[:m.start()].split()[-3:]:
+            tok = tok.strip(".,;:'\"()").lower()
+            if tok.isdigit():
+                best = max(best, int(tok))
+                break
+            if tok in _WORD_NUMS:
+                best = max(best, _WORD_NUMS[tok])
+                break
+    return best
+
+
+def _distinct_page_titles(titles_seen: set[str] | None) -> int:
+    """Distinct visited PAGE titles (measured signature for a counted
+    source subgoal): exclude the search-results page (DDG), the
+    terminal, and the bare browser-chrome titles — about:blank's
+    title is 'Mozilla Firefox' and a new tab's is 'New Tab' (measured),
+    and the initial about:blank counting as a 'visited source' marked
+    the return subgoal at the first results-page click (measured: the
+    T10 run). Real pages carry a tab suffix ('… — Mozilla Firefox')."""
+    bare = {"mozilla firefox", "new tab", ""}
+    n = 0
+    for t in titles_seen or set():
+        tl = t.lower()
+        if tl in bare or "duckduckgo" in tl or "terminal" in tl:
+            continue
+        n += 1
+    return n
+
+
+def _page_titles(titles_seen: set[str] | None) -> list[str]:
+    """The visited source pages, as the planner will know them:
+    bare/DDG/terminal titles dropped, the browser tab suffix
+    (' — Mozilla Firefox') stripped so a title matches the result
+    name in the read dump exactly (measured: the dump's result 1 is
+    'rtx 3060 - anúncios classificados | OLX Portugal' and the page
+    title is that plus the suffix)."""
+    out = []
+    for t in sorted(titles_seen or set()):
+        tl = t.lower()
+        if tl in {"mozilla firefox", "new tab", ""} or "duckduckgo" in tl \
+                or "terminal" in tl:
+            continue
+        p = t.split(" — ")[0].strip()
+        if p and p not in out:
+            out.append(p)
+    return out
+
+
+# Goal-derived search query: 'Search DuckDuckGo for: X' /
+# 'Search DuckDuckGo for "X"'. The deterministic escape from a stuck
+# source page re-runs the goal's own search: the search verb
+# self-focuses the address bar, so it works even when the page's
+# consent dialog blocks browser Back (measured: the T10 run — the
+# KuantoKusta modal, two dead ctrl+Left, the search recovered).
+def _goal_search_query(goal: str) -> str | None:
+    m = re.search(r"\bsearch\s+duckduckgo\s+for\s*[:\-]?\s*[\"']?"
+                  r"(.+?)[\"']?(?:\s*\.\s|\s+and\b|$)",
+                  goal, re.I | re.S)
+    if not m:
+        return None
+    q = m.group(1).strip().strip("\"'").strip()
+    return q if 3 <= len(q) <= 120 else None
+
+
+def _is_source_page(title: str) -> bool:
+    """A visited content page: not the results page, not the
+    terminal, not the bare browser chrome (about:blank's title is
+    'Mozilla Firefox', a new tab's 'New Tab' — both measured)."""
+    if not title:
+        return False
+    tl = title.lower()
+    if tl in ("mozilla firefox", "new tab") or "duckduckgo" in tl \
+            or "terminal" in tl:
+        return False
+    return True
+
+
+def _name_hits(name: str, visited: list[str]) -> bool:
+    """Does a result name from the read dump name a source already
+    opened? The dump's result names ARE the page titles minus the
+    browser suffix (measured: the planner's click phrases were copied
+    verbatim from them), so containment works both ways. Token
+    overlap is NOT used: store listings share category phrases
+    ('Placas Gráficas GeForce RTX 3060 …' across different shops —
+    measured: a 3-token overlap would have excluded the
+    PcComponentes result as 'visited' because KuantoKusta's title
+    carries the same category words)."""
+    n = re.sub(r"\s+", " ", name.lower()).strip()
+    if not n:
+        return False
+    for v in visited:
+        t = re.sub(r"\s+", " ", v.lower()).strip()
+        if t and (n in t or t in n):
+            return True
+    return False
+
+
+def _unopened_from_dump(dump: str, visited: list[str],
+                        limit: int = 2) -> list[str]:
+    """Numbered result names from the last read dump that match no
+    visited source — the concrete pointer the planner's next pick
+    needs (it cannot tell which sources it has already opened;
+    measured: it re-clicked the first result three times in a row
+    with the visited list in its history)."""
+    out: list[str] = []
+    for m in re.finditer(r"^\s*\d+\.\s+(.{8,80})$", dump, re.M):
+        name = m.group(1).strip()
+        if _name_hits(name, visited) or name in out:
+            continue
+        out.append(name)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _dump_result_names(dump: str) -> list[tuple[int, str]]:
+    """The numbered result list of a read dump as (number, name)
+    pairs, in dump order. The planner's click phrase can be a
+    result NUMBER rather than its name: with a degraded title-only
+    dump it has no names to copy and falls back to the number
+    (measured: the T10 run — five 36 s clicks of '1.', grounding
+    found the digit in the window's top strip, 0.0% frame, no
+    navigation). The number resolves to a name only against this
+    list."""
+    out: list[tuple[int, str]] = []
+    for m in re.finditer(r"^\s*(\d+)\.\s+(.{4,80})$", dump, re.M):
+        out.append((int(m.group(1)), m.group(2).strip()))
+    return out
+
+
+def _dump_has_results(dump: str) -> bool:
+    """True if a read dump carries a numbered result list. Right
+    after navigation the a11y tree is still building and a read can
+    return the page title only — the lazy-tree signature (measured:
+    the T10 run — the first read after the search was complete, the
+    ones right after it title-only; the planner then had no result
+    names and clicked the numbers)."""
+    return bool(re.search(r"^\s*\d+\.\s+\S", dump, re.M))
+
+
+def _parse_price(token: str) -> float | None:
+    """A price token from a dump's money: line ('€334', '501€',
+    '680,49€') to a float. EU/PT decimal comma wins when present
+    ('680,49' -> 680.49); a bare dot is a decimal point. None when
+    the token is not a price at all."""
+    t = token.strip().replace("€", "").replace(" ", "")
+    if not t:
+        return None
+    if "," in t:
+        t = t.replace(".", "").replace(",", ".")
+    try:
+        return float(t)
+    except ValueError:
+        return None
 
 
 def _block_commands(text: str) -> list[str]:
@@ -734,6 +1064,25 @@ class Planner:
         seen: set[str] = set()
         subs = [s for s in subs
                 if not (s.lower() in seen or seen.add(s.lower()))]
+        # Drop decomposer garbage (see _subgoal_garbage_reason): meta
+        # prose and token-truncated lines are not atomic actions, and
+        # left in the checklist they block all_done (measured: the
+        # 2026-11-01 battery re-run — T2/T4/T6 drew 'scroll within
+        # page' meta lines that parked in the counted-source branch
+        # and burned the step budget re-doing completed chains).
+        kept = []
+        for s in subs:
+            why = _subgoal_garbage_reason(s)
+            if why:
+                print(f"[planner] dropping garbage subgoal "
+                      f"({why}): {s[:70]!r}", flush=True)
+                continue
+            kept.append(s)
+        subs = kept
+        if not subs:
+            print("[planner] all subgoals garbage; using the goal as "
+                  "one subgoal", flush=True)
+            return [goal.strip()]
         # Drop lines outside the mark surface (see _subgoal_markable):
         # they can never be marked, so they would block all_done
         # forever. When nothing markable survives, the goal's own
@@ -943,6 +1292,15 @@ class OrchestratedAgent:
             scope=scope, monitor=monitor, save_dir=save_dir,
             box_fallback=box_fallback,
         )
+        # Text of the last read dump (the detail string): kept for the
+        # machine's own use — the unopened-result names in the
+        # revisit hints (see _unopened_from_dump).
+        self._last_dump = ""
+        # Every source-page read this run, as (page title, dump):
+        # the measured evidence of the research report (see
+        # _research_facts) — the done summary's facts when the
+        # planner's own report doesn't land.
+        self._source_dumps: list[tuple[str, str]] = []
 
     # ----------------------------------------------------------- sensing
 
@@ -1055,6 +1413,18 @@ class OrchestratedAgent:
             step = Step(verb="wait", arg=f"{seconds:g}", raw=f"wait {seconds:g}")
         elif name == "wait-load":
             step = Step(verb="wait-load", arg="", raw="wait-load")
+        elif name == "read":
+            # No X action: the content comes from the OS accessibility
+            # tree (measured rendered text), not from the frame. The
+            # detail IS the payload — it rides in history as the
+            # planner's page-content evidence.
+            from . import atspi
+            text = atspi.dump_active()
+            if not text:
+                return False, ("read: no accessible content (a11y bus "
+                               "off, or no registered app, or a stalled "
+                               "tree) — use observe, or navigate/retry")
+            return True, f"read: {text}"
         elif name == "observe":
             q = str(args.get("question", "")).strip()
             if not q:
@@ -1104,6 +1474,37 @@ class OrchestratedAgent:
                 return c
         return None
 
+    def _research_facts(self) -> str:
+        """Per-source price facts from the MEASURED read dumps — the
+        content of the done summary for research goals when the
+        planner's own report doesn't land. No LLM in it: every line is
+        a measured dump (the page's own title, the dump's own money:
+        line); 'cheapest' is the min over those measured tokens. ''
+        when no source page was read."""
+        by_title: dict[str, str] = {}
+        for title, dump in self._source_dumps:
+            by_title[title] = dump  # last read of a page wins (revisits)
+        lines: list[str] = []
+        best: tuple[float, str, str] | None = None
+        for title, dump in by_title.items():
+            m = re.search(r"^money:\s*(.+)$", dump, re.M)
+            prices = m.group(1).strip() if m else ""
+            name = re.sub(r"\s*—\s*Mozilla Firefox\s*$", "", title).strip()
+            if prices:
+                lines.append(f"{name}: {prices}")
+            else:
+                lines.append(f"{name}: no prices in the read dump")
+            for tok in prices.split("|"):
+                v = _parse_price(tok)
+                if v is not None and (best is None or v < best[0]):
+                    best = (v, tok.strip(), name)
+        if not lines:
+            return ""
+        out = "sources checked: " + "; ".join(lines)
+        if best:
+            out += f" — cheapest price seen: {best[1]} (on {best[2]})"
+        return out
+
     def _goal_block(self, goal: str, subgoals: list[str],
                     marks: list[bool]) -> str:
         """The goal as the planner sees it, on every planning call.
@@ -1129,7 +1530,8 @@ class OrchestratedAgent:
     def _mark_subgoals(self, subgoals: list[str], marks: list[bool],
                        name: str, ok: bool, args: dict,
                        post: str,
-                       typed: list[str] | None = None) -> bool:
+                       typed: list[str] | None = None,
+                       titles_seen: set[str] | None = None) -> bool:
         """Advance the deterministic progress tracker after a step.
 
         Each mark fires only on measured evidence matching the subgoal's
@@ -1153,6 +1555,30 @@ class OrchestratedAgent:
                 continue
             s = sub.lower()
             terminal_up = "terminal" in post.lower()
+            # Counted source subgoal ('open at least 3 Portuguese
+            # sources'): ONE visited page must not complete it — the
+            # mark needs N DISTINCT visited page titles (goal-derived
+            # count; measured signature: distinct non-results,
+            # non-terminal titles). Checked first so the plain
+            # 'result' branch cannot mark it early (that is exactly the
+            # premature-done the research runs must not hit). The gate
+            # is the strict counted-source signature (see
+            # _counted_sources) — meta prose that merely MENTIONS a
+            # page must not park here forever (measured: the
+            # 2026-11-01 battery re-run, T2/T4/T6).
+            n_open = _counted_sources(s)
+            if n_open >= 2:
+                # The evidence is the READ source pages, not merely
+                # the visited ones: the goal's own words are 'open
+                # the sources one by one (… read the page)', and an
+                # opened-but-unread source has no price for the
+                # report (measured: the T10 run — the third source
+                # was visited, all_done fired before its read, and
+                # the done summary had no price for it).
+                _read_titles = {t for t, _ in self._source_dumps}
+                if _distinct_page_titles(_read_titles) >= n_open:
+                    marks[idx] = changed = True
+                continue
             if "terminal" in s:
                 # 'type'/'echo' only: 'run the command' belongs to the
                 # enter branch, not the type branch. A subgoal that asks
@@ -1183,6 +1609,20 @@ class OrchestratedAgent:
                     # the terminal, type exactly this command: …'
                     # was marked on the open, and all_done fired
                     # before the file was ever written).
+                    marks[idx] = changed = True
+            elif ("result" in s
+                    and any(p in s for p in
+                            ("return to", "go back to", "back to",
+                             "come back to"))):
+                # 'Return to the results page (ctrl+Left)': the generic
+                # 'result' branch below marks this the moment we LEAVE
+                # the results page — the opposite of the subgoal
+                # (measured: the T10 run marked it at the first source
+                # open, and all_done fired with 1 of 3 sources). The
+                # measured signature of the return: a DDG title with at
+                # least one non-results page already visited.
+                if ("duckduckgo" in post.lower()
+                        and _distinct_page_titles(titles_seen) >= 1):
                     marks[idx] = changed = True
             elif "result" in s and "duckduckgo" not in post.lower():
                 marks[idx] = changed = True
@@ -1226,7 +1666,9 @@ class OrchestratedAgent:
         return changed
 
     def _settled_next(self, post: str,
-                      goal_block: str) -> tuple[str, tuple[str, dict] | None] | None:
+                      goal_block: str, pre: str = "",
+                      seen_before: set[str] | None = None,
+                      last_dump: str = "") -> tuple[str, tuple[str, dict] | None] | None:
         """The canonical next step once the current page has settled.
 
         Shared by the wait-load branch (the wait finished) and the
@@ -1236,16 +1678,67 @@ class OrchestratedAgent:
         measured 8.1 s).
         """
         low = goal_block.lower()
+        # A wait-load that did NOT move the title: the navigation the
+        # key/click was meant to trigger is dead (measured: the T10
+        # run — the KuantoKusta consent dialog swallowed Back; read
+        # still dumps the prices behind it, but the page will not
+        # leave). The search verb self-focuses the address bar, so
+        # re-running the goal's own search is the measured escape.
+        if (not _wants_a_specific_result(goal_block) and pre == post
+                and _is_source_page(post)):
+            q = _goal_search_query(goal_block)
+            if q:
+                return ("SUGGESTED NEXT: search "
+                        + json.dumps({"query": q})
+                        + " (Back did not navigate — this page blocks "
+                          "it; the search goes through the address bar "
+                          "and lands back on the results page).",
+                        ("search", {"query": q}))
+        # Research goal on a source page: the goal's own recipe is
+        # 'wait-load, read the page, back' — the machine runs it,
+        # because the 1.7B planner fixates on re-clicking the page's
+        # own title text instead (measured: the T10 run burned its
+        # failure budget that way). A REVISIT (the title was already
+        # seen before this step — the machine's visited set, which
+        # the planner cannot track) goes straight back, with the
+        # opened list AND the unopened results from the last dump, so
+        # the next pick is driven by measured state.
+        if not _wants_a_specific_result(goal_block) and _is_source_page(post):
+            visited = _page_titles(seen_before)
+            if post in (seen_before or set()):
+                unopened = _unopened_from_dump(last_dump, visited)
+                _extra = (" Unopened results in the last read dump: "
+                          + "; ".join(f"'{u[:60]}'" for u in unopened)
+                          if unopened else "")
+                _opened = "; ".join(v[:50] for v in visited) or "none"
+                return ("SUGGESTED NEXT: key {\"combo\": \"ctrl+Left\"} "
+                        "(you just RE-opened a source you had already "
+                        f"opened; opened so far: {_opened}. Back to the "
+                        "results page to pick a DIFFERENT source."
+                        + _extra + ")",
+                        ("key", {"combo": "ctrl+Left"}))
+            return ("SUGGESTED NEXT: read {} (a source page just loaded; "
+                    "read it — the dump carries the page's text and "
+                    "prices; after reading, browser Back returns to "
+                    "the results page).",
+                    ("read", {}))
         if "duckduckgo" in post.lower():
-            if re.search(r"\bresult", goal_block, re.I):
+            if _wants_a_specific_result(goal_block):
                 return ("SUGGESTED NEXT: click "
                         "{\"phrase\": \"the first result in the search "
                         "results\"} (the results page is still up and "
-                        "the goal wants a result).",
+                        "the goal wants that result).",
                         ("click",
                          {"phrase": "the first result in the search results"}))
-            return ("SUGGESTED NEXT: continue with the next unfinished "
-                    "subgoal (the page has settled).", None)
+            # Research goals back on the results page (after a source):
+            # re-read before picking the next source — the planner's
+            # source pick is driven by the dump, not by memory of a page
+            # it cannot see.
+            return ("SUGGESTED NEXT: read {} (the results page is up "
+                    "again; the dump lists the results NUMBERED with "
+                    "their URLs — open a source you have NOT opened "
+                    "yet, by name or position).",
+                    ("read", {}))
         if re.search(r"\bscroll", low):
             n = self._scroll_amount(goal_block)
             args = {"phrase": "the article", "amount": n}
@@ -1259,7 +1752,11 @@ class OrchestratedAgent:
     def _suggestion(self, name: str, ok: bool, pre: str, post: str,
                     goal_block: str,
                     all_done: bool = False,
-                    typed: list[str] | None = None) -> tuple[str, tuple[str, dict] | None] | None:
+                    typed: list[str] | None = None,
+                    titles_seen: set[str] | None = None,
+                    seen_before: set[str] | None = None,
+                    last_dump: str = "",
+                    detail: str = "") -> tuple[str, tuple[str, dict] | None] | None:
         """The canonical next step, suggested by the deterministic layer.
 
         Returns (history_line, (tool_name, args) | None). When the
@@ -1278,29 +1775,59 @@ class OrchestratedAgent:
         if not ok:
             return None
         if all_done:
-            # Every subgoal is marked on MEASURED evidence, so the goal
-            # is achieved by construction; the marks ARE the done
-            # evidence. Executed directly by the protocol — the 1.7B
-            # planner never called done on its own even with every
-            # subgoal marked [DONE] (measured).
-            subs = [m.group(1) for m in re.finditer(
-                r"^\d+\. \[DONE\] (.+)$", goal_block, re.M)]
-            summary = "all subgoals done: " + "; ".join(subs) if subs \
-                else "all subgoals done"
-            return ("SUGGESTED NEXT: done — every subgoal is [DONE] "
-                    "(verified by titles, frame changes and window "
-                    "state).",
-                    ("done", {"summary": summary}))
+            # Every subgoal is marked on MEASURED evidence. The final
+            # turn goes to the PLANNER, not a mechanical execution:
+            # its summary is the deliverable, and for research goals
+            # the mechanical checklist summary cannot carry the
+            # compared facts (measured: a smoke run ended with the
+            # goal text parroted back, zero facts). The 1.7B planner
+            # under-calls done with the marks up (measured), so the
+            # HINT below is deterministic and _run_loop falls back to
+            # the mechanical auto-done after two hint turns — the
+            # termination guarantee is unchanged.
+            _hint = ("HINT: every subgoal is [DONE] on measured "
+                    "evidence. Call done NOW with a summary that "
+                    "ANSWERS the goal: every fact you collected (the "
+                    "read dumps in the history are your evidence) "
+                    "with its source. If the goal's own completion "
+                    "criterion (e.g. how many sources it names) is not "
+                    "yet met, work the next unfinished part instead.")
+            if not _wants_a_specific_result(goal_block):
+                # The report's facts, measured, in the hint itself:
+                # the planner's done summary copies them (measured:
+                # without them in the prompt its summary was a
+                # checklist parrot with zero facts — the T10 run).
+                _facts = self._research_facts()
+                if _facts:
+                    _hint += (" Measured facts from the read dumps "
+                              "(report them, each with its source): "
+                              + _facts)
+            return (_hint, None)
         low = goal_block.lower()
         results_page = "duckduckgo" in post.lower()
         if name in ("search", "duckduckgo") and results_page:
-            if re.search(r"\bresult", goal_block, re.I):
+            if _wants_a_specific_result(goal_block):
                 return ("SUGGESTED NEXT: click "
                         "{\"phrase\": \"the first result in the search "
                         "results\"} (the results page is up and the "
-                        "goal wants a result).",
+                        "goal wants that result).",
                         ("click",
                          {"phrase": "the first result in the search results"}))
+            # Research/comparison goals: the canonical next step is the
+            # content channel — the planner must SEE the results (names
+            # + URLs + prices) before it can pick a source. Without this
+            # suggestion the planner fixated on re-running the same
+            # search until the failure budget (measured: the T10 run —
+            # the 1.7B anchored on the goal's 'Search ...' clause). read
+            # is a screen no-op, so executing it directly is safe.
+            _visited = _page_titles(titles_seen)
+            _extra = (" Already opened: " + "; ".join(v[:50] for v in _visited)
+                      + " — pick a DIFFERENT one." if _visited else "")
+            return ("SUGGESTED NEXT: read {} (the results page is up; "
+                    "read is how you see its content — the result "
+                    "names, URLs and prices — before picking a source."
+                    + _extra + ")",
+                    ("read", {}))
         if name == "click":
             if "duckduckgo" in pre.lower() and post == pre:
                 # Title unchanged: the navigation may still be in
@@ -1311,13 +1838,92 @@ class OrchestratedAgent:
                         "still be navigating; wait for the new page "
                         "before acting).",
                         ("wait-load", {}))
+            if (not _wants_a_specific_result(goal_block)
+                    and pre == post
+                    and _is_source_page(post)):
+                # No-op click on a source page (research goal): the
+                # click changed nothing — dead space, or the page's
+                # consent dialog swallowed it (measured: the T10 run —
+                # 34 s of grounding, the click landed on the dimmed
+                # area of the KuantoKusta modal, 0.0% frame). The
+                # content channel still works behind the dialog (the
+                # a11y tree carries the page's text + prices —
+                # measured), so READ first; the read->back chain then
+                # recovers.
+                return ("SUGGESTED NEXT: read {} (the click changed "
+                        "nothing — the page may show a consent dialog "
+                        "on top of it; read still dumps the page's "
+                        "text and prices behind the dialog).",
+                        ("read", {}))
             # The title already moved (fast nav) or the click was not
             # on a results page: settle directly — a wait-load here
             # would compare against an already-changed title and burn
             # its full cap (measured 8.1 s).
-            return self._settled_next(post, goal_block)
+            return self._settled_next(post, goal_block, pre=pre,
+                                      seen_before=seen_before,
+                                      last_dump=last_dump)
         if name == "wait-load":
-            return self._settled_next(post, goal_block)
+            return self._settled_next(post, goal_block, pre=pre,
+                                      seen_before=seen_before,
+                                      last_dump=last_dump)
+        if name == "read" and "duckduckgo" in post.lower() \
+                and not _wants_a_specific_result(goal_block) \
+                and not _dump_has_results(detail):
+            # Degraded read right after navigation: the a11y tree is
+            # still building, the dump carries the page title only,
+            # and the planner is left with no result names to copy —
+            # it falls back to clicking a result NUMBER (measured:
+            # the T10 run — five 36 s clicks of '1.' after three
+            # title-only reads). A re-read is usually complete by
+            # then; if the tree is truly stuck, the per-state repeat
+            # guard bounds the re-reads to two and hands the wheel
+            # back to the planner.
+            return ("SUGGESTED NEXT: read {} (the last read got only "
+                    "the page title — its a11y tree is still "
+                    "building; a re-read carries the numbered result "
+                    "list).",
+                    ("read", {}))
+        if name == "read" and "duckduckgo" in post.lower() \
+                and not _wants_a_specific_result(goal_block):
+            # Full dump on the results page (research goal): the
+            # MACHINE drives the source pick. Measured: the 1.7B
+            # fixates on the first result even with the unopened
+            # names listed in the hints (the T10 run — six revisits
+            # of the same two sources after two distinct; the step
+            # budget died on revisits, not on navigation). The next
+            # source is the first UNOPENED result of the measured
+            # dump, in list order — deterministic, and exactly the
+            # goal's "open a source you have NOT opened yet". The
+            # click phrase is the result name verbatim from the
+            # dump, so grounding finds it on the page (2–4 s).
+            visited = _page_titles(seen_before or set())
+            unopened = _unopened_from_dump(detail, visited)
+            if unopened:
+                return ("SUGGESTED NEXT: click "
+                        + json.dumps({"phrase": unopened[0]})
+                        + " (this source has NOT been opened yet — "
+                          "the machine picks the first unopened "
+                          "result from the measured dump; after the "
+                          "read, browser Back returns here for the "
+                          "next one).",
+                        ("click", {"phrase": unopened[0]}))
+            # Every result in the dump is already visited: the
+            # source budget is spent — the planner's wheel (the
+            # final report, or a different query).
+            return None
+        if name == "read" and "duckduckgo" not in post.lower() \
+                and "terminal" not in post.lower() \
+                and not _wants_a_specific_result(goal_block):
+            # Research goal: the source page has been read; the
+            # canonical next step is browser Back to the results page.
+            # Without this the planner fixated on re-clicking the
+            # source's own title text (it IS on the page) instead of
+            # navigating — 4 clicks of the product title burned the
+            # failure budget (measured: the T10 run).
+            return ("SUGGESTED NEXT: key {\"combo\": \"ctrl+Left\"} "
+                    "(the source page is read; browser Back returns to "
+                    "the results page, where the next source is picked).",
+                    ("key", {"combo": "ctrl+Left"}))
         if name == "scroll":
             if re.search(r"\bterminal\b", low) and "terminal" not in post.lower():
                 return ("SUGGESTED NEXT: open {\"app\": \"terminal\"} "
@@ -1340,6 +1946,33 @@ class OrchestratedAgent:
             return ("SUGGESTED NEXT: key {\"combo\": \"enter\"} (execute "
                     "the typed command).",
                     ("key", {"combo": "enter"}))
+        if (name == "key" and pre == post and _is_source_page(post)
+                and not _wants_a_specific_result(goal_block)):
+            # A key that changed nothing on a source page: browser
+            # Back that may still be navigating (measured slow-nav) —
+            # or dead, because the page's consent dialog blocks it
+            # (measured: the T10 run — two ctrl+Left, the screen
+            # identical, the KuantoKusta modal up). wait-load
+            # disambiguates: it settles a real navigation; a
+            # still-stuck wait-load lands on the search escape in
+            # _settled_next.
+            return ("SUGGESTED NEXT: wait-load {} (the key may still "
+                    "be navigating; wait for the results page to "
+                    "land).",
+                    ("wait-load", {}))
+        if name == "key" and "duckduckgo" in post.lower() \
+                and not _wants_a_specific_result(goal_block):
+            # Research goal, back on the results page: re-read before
+            # the next pick — the numbered dump is what drives which
+            # source to open next.
+            _visited = _page_titles(titles_seen)
+            _extra = (" Already opened: " + "; ".join(v[:50] for v in _visited)
+                      + " — open a DIFFERENT source." if _visited else "")
+            return ("SUGGESTED NEXT: read {} (back on the results page; "
+                    "the dump lists the results NUMBERED with their "
+                    "URLs — open a source you have NOT opened yet, by "
+                    "name or position." + _extra + ")",
+                    ("read", {}))
         if name == "key" and "terminal" in post.lower():
             # Multi-command goals (measured: T5): after a command has
             # run, the next command still quoted in the checklist and
@@ -1414,10 +2047,11 @@ class OrchestratedAgent:
         # step — and it sees every executed result in the history.
         pending: tuple[str, dict] | None = None
         # Repeat-guard retry budget (see the guard below): how many times
-        # each (step, args) has actually executed. A step seen in the same
-        # state twice may run one more time (fresh grounding is the
-        # remedy for a stale target); from the second retry on it is
-        # blocked.
+        # each (step, args) has actually executed IN ITS CURRENT STATE
+        # (reset when the step's saved state no longer matches — see the
+        # guard). A step seen in the same state twice may run one more
+        # time (fresh grounding is the remedy for a stale target); from
+        # the second retry on it is blocked.
         attempts: dict = {}
         # Verbatim text of every executed type step: the mark logic
         # requires a command subgoal's own command(s) in this history
@@ -1426,6 +2060,16 @@ class OrchestratedAgent:
         # Deterministic subgoal progress (see _mark_subgoals); rebuilt
         # into the goal block before every planning call.
         marks = [False] * len(subgoals)
+        # Every page title seen this run (initial + post-step): the
+        # measured signature of the counted source subgoals (a counted
+        # 'open N sources' subgoal marks only at N distinct page
+        # titles — see _mark_subgoals).
+        titles_seen: set[str] = {self._title()}
+        # Planner turns spent with every subgoal marked [DONE] but no
+        # done emitted (see the all-done branch in _suggestion): after
+        # two, the protocol executes the mechanical auto-done — the
+        # termination guarantee the fast path used to provide.
+        done_tries = 0
         for i in range(self.max_steps):
             if time.time() - t0 > self.max_seconds:
                 print(f"[orch] budget of {self.max_seconds:.0f} s exceeded; "
@@ -1446,6 +2090,92 @@ class OrchestratedAgent:
                     print(f"[orch] planner error at step {i + 1}: {e}",
                           flush=True)
                     return False
+                # A planner click whose phrase is EXACTLY a key combo is
+                # the 1.7B echoing the suggestion history's key JSON
+                # (measured: the T10 run — it saw 'key {"combo":
+                # "ctrl+Left"}' in the history and clicked it; 31 s of
+                # grounding for a phrase that is not on the page, the
+                # click landed on the toolbar edge, 0.9% frame). Rewrite
+                # it to the key before spending a vision pass; the
+                # dead-key chain recovers if the key changes nothing.
+                if (name == "click"
+                        and not _wants_a_specific_result(goal)
+                        and re.fullmatch(r"[a-z]+(\+[a-z]+)+",
+                                         str(args.get("phrase", "")),
+                                         re.I)):
+                    _c = str(args.get("phrase", "")).strip()
+                    print(f"[orch] planner click phrase {args.get('phrase')!r} "
+                          f"is a key combo; executing it as a key",
+                          flush=True)
+                    name, args = "key", {"combo": _c}
+                # A planner click whose phrase is EXACTLY a result
+                # number ('1.') is the 1.7B without the names in
+                # front of it (a degraded title-only dump) falling
+                # back to the number (measured: the T10 run — five 36
+                # s clicks of '1.'; the digit is in the window's top
+                # strip, the click is a no-op). Resolve it to the
+                # full name from the last good read dump; if no dump
+                # with a numbered list is on hand, re-read — the
+                # click would burn a full grounding pass for a phrase
+                # that is not the page's content.
+                if (name == "click"
+                        and not _wants_a_specific_result(goal)
+                        and re.fullmatch(r"\d{1,2}\.{0,1}",
+                                         str(args.get("phrase", "")))):
+                    _num = int(str(args.get("phrase")).strip().rstrip("."))
+                    _full = next((n for k, n in _dump_result_names(
+                                       self._last_dump) if k == _num), None)
+                    if _full:
+                        print(f"[orch] planner click phrase "
+                              f"{args.get('phrase')!r} is a result "
+                              f"number; resolved to {_full!r} from the "
+                              f"last read dump", flush=True)
+                        name, args = "click", {"phrase": _full}
+                    else:
+                        print(f"[orch] planner click phrase "
+                              f"{args.get('phrase')!r} is a result "
+                              f"number but the last read dump has no "
+                              f"numbered results (degraded); "
+                              f"re-reading instead", flush=True)
+                        name, args = "read", {}
+                if name != "done" and marks and all(marks):
+                    # Every subgoal is [DONE] on measured evidence and
+                    # the wheel is the planner's (see the all-done
+                    # branch of _suggestion): its summary is the
+                    # deliverable, so the run ends when IT calls done.
+                    # The hint is already in the history (appended by
+                    # the suggestion after the last mark). Counted are
+                    # NON-DONE answers, so the planner keeps one full
+                    # call to collect what is missing (a read) before
+                    # the one that must produce the report (measured:
+                    # the smoke run's planner read after the last mark,
+                    # then needed the next call for the done). After
+                    # two non-done answers the protocol executes the
+                    # mechanical auto-done — the termination guarantee
+                    # the fast path used to provide (the 1.7B planner
+                    # under-calls done with the marks up — measured).
+                    done_tries += 1
+                    if done_tries >= 2:
+                        subs = [m.group(1) for m in re.finditer(
+                            r"^\d+\. \[DONE\] (.+)$", goal_block, re.M)]
+                        summary = ("all subgoals done: " + "; ".join(subs)
+                                   if subs else "all subgoals done")
+                        # Research goal: the checklist parrot is not
+                        # the deliverable — the report is the measured
+                        # facts (sources + prices + cheapest) from the
+                        # read dumps (measured: the T10 run ended on
+                        # exactly this fallback with zero facts).
+                        if not _wants_a_specific_result(goal):
+                            _facts = self._research_facts()
+                            if _facts:
+                                summary = _facts
+                        print(f"[orch] planner ignored the done hint "
+                              f"twice; the protocol executes the "
+                              f"mechanical done", flush=True)
+                        print(f"[orch] done: {summary} "
+                              f"({time.time() - t0:.1f} s total, "
+                              f"{i + 1} steps)", flush=True)
+                        return True
             print(f"[orch] step {i + 1}: {name} "
                   f"{json.dumps(args, ensure_ascii=False)}", flush=True)
             if name == "done":
@@ -1458,6 +2188,11 @@ class OrchestratedAgent:
                 return True
             t = time.time()
             pre = self._title()
+            # The visited set BEFORE this step: the revisit check in
+            # _settled_next needs to know whether the post title was
+            # seen earlier, and titles_seen gains the post title
+            # below before the suggestion is computed.
+            seen_before = set(titles_seen)
             # Repeat guard: the same step in the same screen state cannot
             # do anything new — the planner can be stuck repeating a step
             # that "succeeded" (or failed) without changing the world
@@ -1486,8 +2221,17 @@ class OrchestratedAgent:
             # a step already seen in this title with a spent retry
             # budget costs one extra grab.
             _ss = seen_sig.get(key)
-            _repeat = _ss is not None and _ss[0] == pre \
-                and attempts.get(key, 0) >= 2
+            _same_state = _ss is not None and _ss[0] == pre
+            if not _same_state:
+                # The retry count is per-STATE, not global: a step
+                # repeated across DIFFERENT states is legitimate — the
+                # research chain re-reads the results page after every
+                # return, and a global count blocked the chain's own
+                # read/search steps once a few had run (measured: the
+                # T10 run — blocked reads and searches burned the
+                # failure budget at steps 18/25/30-32).
+                attempts[key] = 0
+            _repeat = _same_state and attempts.get(key, 0) >= 2
             _pre_sig = None
             if _repeat:
                 from . import screen
@@ -1523,11 +2267,32 @@ class OrchestratedAgent:
                     # confirm THIS subgoal's command was typed (not just
                     # some command). Failed types typed nothing.
                     typed.append(str(args.get("text", "")))
+                if name == "read" and ok and _dump_has_results(detail) \
+                        and "duckduckgo" in pre.lower():
+                    # The dump rides in history as the planner's
+                    # content evidence; keep a copy for the machine's
+                    # own use (the unopened-result names in the
+                    # revisit hints — see _unopened_from_dump — and
+                    # the number->name resolution of the planner's
+                    # '1.' clicks — see _dump_result_names). Only a
+                    # DDG dump that actually carries the numbered
+                    # list is kept: a title-only dump is degraded
+                    # (the a11y tree is still building — measured:
+                    # the T10 run) and overwriting the last good
+                    # list with it breaks both uses; a source page's
+                    # numbered list items are not the results list.
+                    self._last_dump = detail
                 post_cap = screen.capture(scope=self.agent.scope,
                                           monitor_index=self.agent.monitor).image
                 frame_pct = f"{100.0 * _frame_diff(pre_cap, post_cap) / 255.0:.1f}"
                 post = self._title()
+                if name == "read" and ok and _is_source_page(post):
+                    # Evidence of the research report (see
+                    # _research_facts): the dump of every source
+                    # page read this run.
+                    self._source_dumps.append((post, detail))
                 seen_sig[key] = (post, _frame_sig(post_cap))
+                titles_seen.add(post)
             dt = time.time() - t
             line = (f"step {i + 1}: {name}({json.dumps(args, ensure_ascii=False)}) "
                     f"-> {'ok' if ok else 'FAILED'} in {dt:.1f}s; "
@@ -1556,7 +2321,7 @@ class OrchestratedAgent:
             # consumed above), so the planner simply re-plans next turn.
             if not blocked:
                 self._mark_subgoals(subgoals, marks, name, ok, args, post,
-                                    typed=typed)
+                                    typed=typed, titles_seen=titles_seen)
                 # The fresh block (post-step marks) is what the planner
                 # will see next turn, and it is what the done-summary
                 # regex reads [DONE] lines from.
@@ -1567,7 +2332,11 @@ class OrchestratedAgent:
                                        and all(marks)
                                        and _goal_commands_run(goal, history,
                                                                 typed),
-                                       typed=typed)
+                                       typed=typed,
+                                       titles_seen=titles_seen,
+                                       seen_before=seen_before,
+                                       last_dump=self._last_dump,
+                                       detail=detail)
                 if sug is None:
                     pending = None
                 elif sug[1] is None:
@@ -1600,6 +2369,25 @@ class OrchestratedAgent:
                         history.append(sug_line)
                         pending = machine
 
+            # Research goals: the visited-source state is kept OUTSIDE
+            # the planner (measured: the 1.7B re-read the same dump and
+            # re-opened the same first result, then spammed ctrl+Left —
+            # it cannot remember what it has visited; the machine has
+            # it in titles_seen, and this line is the measured fact it
+            # is missing, in its own history).
+            if not _wants_a_specific_result(goal):
+                _pages = _page_titles(titles_seen)
+                _prog = (f"PROGRESS: distinct sources opened so far: "
+                         f"{len(_pages)}")
+                if _pages:
+                    _prog += " — " + "; ".join(p[:60] for p in _pages)
+                _n = _counted_open(goal)
+                if _n >= 2 and len(_pages) < _n:
+                    _prog += (f"; the goal asks for at least {_n} — open a "
+                              "source you have NOT opened yet (a "
+                              "different numbered result from the read "
+                              "dump)")
+                history.append(_prog)
             if self.agent.dry_run and i == 0:
                 # A dry run never changes the world, so "achieve the goal"
                 # can never be evidenced; the measured failure mode is the
