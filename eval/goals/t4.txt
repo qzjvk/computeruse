@@ -1,0 +1,1 @@
+Search DuckDuckGo for "docker nvidia runtime container gpu not found" and open the first result. Scroll the article down 3 notches. Open a terminal. In the terminal, type exactly this command: echo 'T4: single and "double" quotes ok' > /root/note.txt — then press Enter. Call done when everything is complete.

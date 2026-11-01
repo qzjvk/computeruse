@@ -1,0 +1,1 @@
+Search DuckDuckGo for "kubernetes gpu scheduling nvidia device plugin" and open the first result. Scroll the article down 4 notches. Open a terminal. In the terminal, type exactly this command: echo "T6: attach existing terminal" > /root/note.txt — then press Enter. Call done when everything is complete.

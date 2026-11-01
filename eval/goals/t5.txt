@@ -1,0 +1,1 @@
+Search DuckDuckGo for "docker nvidia gpus unknown error runc cgroup v2" and open the first result. Scroll the article down 3 notches. Open a terminal. In the terminal, type exactly this command: echo first-line > /root/multi.txt — press Enter. Then type exactly this command: echo second-line >> /root/multi.txt — press Enter. Call done when both commands have run.

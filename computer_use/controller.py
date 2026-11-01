@@ -108,11 +108,20 @@ _CENTER_BOX_Y = (-70.0, 100.0)    # pixel offsets from the capture center
 # x≈108..728 of a 1280 px window. A deterministic band around that zone
 # (x 0..0.6w, y 0.62h..0.8h) contains it with ~30 px margin while the
 # crop is ~430 patches (~2 s prefill on the 1070 vs ~16.5 s for the
-# full window). Same fallback as the other deterministic boxes.
+# full window). The band is a prior for the bare-results layout: when a
+# page element (an AI answer widget) pushes the first result below 0.8h,
+# _zoom_ground escalates to the band extended to the window bottom before
+# the box-pass fallback. Same fallback as the other deterministic boxes.
 _RESULTS_CONTAINERS = frozenset({
     "search results", "results", "results list", "search results list",
 })
 _RESULTS_BOX = (0.0, 0.62, 0.6, 0.8)   # fractions of the capture (x1, y1, x2, y2)
+# A grounded point below this fraction of the results band is a "the band
+# missed the target" signature: the first result sits at the TOP of the
+# list, so a point in the band's bottom is the band-edge caption or a page
+# element below the real result (measured: T1 — the "Auto-generated…"
+# caption at 77% of the band; the normal title row is at 38-50%).
+_RESULTS_EDGE_FRAC = 0.70
 
 # Containers that live on a screen edge (XFCE: top menu panel, bottom
 # launcher panel, tray, clock). For these, a box touching the edge is
@@ -279,6 +288,13 @@ def _frame_diff(a, b) -> float:
 # mean by far more; a cursor or antialiasing flicker stays below this.
 _SETTLE_DIFF = 8.0
 
+# Mean grayscale diff (%) below which a re-capture taken right after a
+# grounding vision pass counts as "the page did not move while the pass
+# ran". A stable page measures under ~1%; a real layout shift (a widget
+# expanding, an ad loading) moves the mean by several percent — measured
+# 2.5% for the DDG Search Assist expansion (T1).
+_REGROUND_DIFF_PCT = 2.0
+
 
 class Agent:
     """Perceive -> ground -> act loop on top of a LocateAnythingWorker."""
@@ -358,7 +374,10 @@ class Agent:
             target = self._ground(step.arg, i,
                                   coarse_patches=_SCROLL_COARSE_PATCHES)
         else:
-            target = self._ground(step.arg, i)
+            # Click-type verbs need the exact point, and the vision pass
+            # gives a dynamic page time to move: re-capture and re-ground
+            # once if the frame shifted (see _ground's `reground`).
+            target = self._ground(step.arg, i, reground=True)
         if target is None:
             return False
         ax, ay = target
@@ -720,40 +739,74 @@ class Agent:
 
     # -------------------------------------------------------------- ground
 
+    def _view_for(self, cap, coarse_patches: Optional[int]):
+        """Build the (possibly shrunk) view the vision pass runs on.
+
+        `coarse_patches` bounds the vision patch count: an oversized
+        capture is shrunk to fit (region-level accuracy is enough for a
+        scroll point, and the prefill is ~6x faster). Returns `cap`
+        unchanged when no shrink is needed.
+        """
+        if coarse_patches is None:
+            return cap
+        w, h = cap.image.size
+        patches = (w // 14) * (h // 14)
+        if patches <= coarse_patches:
+            return cap
+        import math
+        from PIL import Image  # local import
+
+        scale = math.sqrt(coarse_patches / patches)
+        vw, vh = max(14, int(w * scale)), max(14, int(h * scale))
+        while (vw // 14) * (vh // 14) > coarse_patches:
+            vw, vh = int(vw * 0.98), int(vh * 0.98)
+        resample = getattr(Image, "Resampling", Image)
+        print(f"    coarse view: {w}x{h} ({patches} patches) -> {vw}x{vh} "
+              f"({(vw // 14) * (vh // 14)} patches)")
+        return screen.Capture(
+            image=cap.image.resize((vw, vh), resample.BILINEAR),
+            monitor=cap.monitor,
+        )
+
     def _ground(self, phrase: str, step: int,
-                coarse_patches: Optional[int] = None) -> Optional[tuple[float, float]]:
+                coarse_patches: Optional[int] = None,
+                reground: bool = False) -> Optional[tuple[float, float]]:
         """Screenshot, ground `phrase`, map to desktop coords, save evidence.
 
-        `coarse_patches` bounds the vision patch count: if the capture is
-        larger, it is shrunk to fit before grounding (the full-resolution
-        capture is still saved as evidence, and Capture.to_screen maps the
-        coarse point back to desktop coordinates). Step types that only
-        need a point *inside* a large region (scroll) pass this — region
-        accuracy at a fraction of the prefill time.
+        `coarse_patches` bounds the vision patch count (see _view_for):
+        step types that only need a point *inside* a large region
+        (scroll) pass this — region accuracy at a fraction of the
+        prefill time.
+
+        `reground` guards against the page moving *during* the vision
+        pass: after grounding, the frame is re-captured and, if it moved
+        by more than `_REGROUND_DIFF_PCT`, the phrase is grounded once on
+        the fresh capture. The pass takes seconds on a shared GPU, and a
+        dynamic page can shift in that window (measured: DDG's Search
+        Assist widget expanded mid-pass, pushing the first result ~150px
+        down, so the click hit the widget and never navigated). The saved
+        evidence screenshot is of the capture the final grounding used.
         """
         cap = screen.capture(scope=self.scope, monitor_index=self.monitor)
         w, h = cap.image.size
-
-        view = cap
-        if coarse_patches is not None:
-            patches = (w // 14) * (h // 14)
-            if patches > coarse_patches:
-                import math
-                from PIL import Image  # local import
-
-                scale = math.sqrt(coarse_patches / patches)
-                vw, vh = max(14, int(w * scale)), max(14, int(h * scale))
-                while (vw // 14) * (vh // 14) > coarse_patches:
-                    vw, vh = int(vw * 0.98), int(vh * 0.98)
-                resample = getattr(Image, "Resampling", Image)
-                view = screen.Capture(
-                    image=cap.image.resize((vw, vh), resample.BILINEAR),
-                    monitor=cap.monitor,
-                )
-                print(f"    coarse view: {w}x{h} ({patches} patches) -> {vw}x{vh} "
-                      f"({(vw // 14) * (vh // 14)} patches)")
-
+        view = self._view_for(cap, coarse_patches)
         target = self._ground_capture(view, phrase)
+        if target is not None and reground and not self.dry_run:
+            fresh = screen.capture(scope=self.scope,
+                                   monitor_index=self.monitor)
+            moved = 100.0 * _frame_diff(fresh.image, cap.image) / 255.0
+            if moved > _REGROUND_DIFF_PCT:
+                print(f"    page moved {moved:.1f}% during the vision pass; "
+                      f"re-grounding on the fresh capture")
+                stale = target
+                cap = fresh
+                w, h = cap.image.size
+                view = self._view_for(cap, coarse_patches)
+                target = self._ground_capture(view, phrase)
+                if target is None:
+                    target = stale
+                    print("    re-grounding found no point; "
+                          "keeping the stale one")
         if target is None:
             print("    grounding failed: no point/box in the answer")
             return None
@@ -960,7 +1013,36 @@ class Agent:
             zt = self._zoom_attempt(
                 img, phrase, container, box=box,
                 box_note="known results band", det_edge="results",
-                pass2_box_first=True, det_trust=True)
+                pass2_box_first=True, det_trust=True, strict_box=True)
+            if zt is None:
+                # The box pass found no result in the band (an explicit
+                # full-frame "no target in this crop" box, or a degenerate
+                # one): the band may have missed the target — a page element
+                # (an AI answer widget) can push the first result below the
+                # band bottom (measured: DDG's Search Assist, T2 — the box
+                # pass knew, but the trusted point fallback then latched
+                # onto the widget text). Retry with the band extended to
+                # the window bottom.
+                ext = (box[0], box[1], box[2], float(h))
+                zt = self._zoom_attempt(
+                    img, phrase, container, box=ext,
+                    box_note="extended results band", det_edge="results",
+                    pass2_box_first=True, det_trust=True, strict_box=True)
+                if zt is not None:
+                    return zt
+            elif zt[1] > box[1] + (box[3] - box[1]) * _RESULTS_EDGE_FRAC:
+                # A point in the band's bottom: the first result sits at the
+                # TOP of the list, so this is the model latching onto the
+                # band-edge caption while the real result is below the band
+                # (measured: T1, caption at 77% of the band). Re-ground once
+                # in the extended band and prefer its answer.
+                ext = (box[0], box[1], box[2], float(h))
+                zt2 = self._zoom_attempt(
+                    img, phrase, container, box=ext,
+                    box_note="extended results band", det_edge="results",
+                    pass2_box_first=True, det_trust=True, strict_box=True)
+                if zt2 is not None:
+                    return zt2
             if zt is not None:
                 return zt
             print("    zoom: deterministic results band failed; falling back "
@@ -978,7 +1060,8 @@ class Agent:
                       box=None, box_note: Optional[str] = None,
                       det_edge: Optional[str] = None,
                       pass2_box_first: bool = False,
-                      det_trust: bool = False) -> Optional[tuple[float, float]]:
+                      det_trust: bool = False,
+                      strict_box: bool = False) -> Optional[tuple[float, float]]:
         """One pass-1 (+ pass-2) attempt. Returns capture pixels or None.
 
         ``box``: a pre-supplied container box (the deterministic edge
@@ -995,6 +1078,15 @@ class Agent:
         local-std floor is high on a text-dense crop; measured: a
         correct box on the title row, std 56 < floor 70, was rejected
         by the gate).
+        ``strict_box``: when the box pass finds no usable box (including
+        the explicit full-frame "no target in this crop" box), skip the
+        trusted point fallback and return None. A point on whatever
+        texture happens to sit in the crop would otherwise be accepted
+        (measured: T2 — the box pass knew the band held no result, but
+        the point fallback latched onto the AI widget's text and the
+        click hit the widget). Returning None lets the caller widen the
+        crop (the extended results band) instead of acting on a known-
+        bad point.
         """
         import math
         from PIL import Image  # local import
@@ -1219,6 +1311,46 @@ class Agent:
                                         verbose=False)
             print(f"    zoom answer: (box) {result.answer.strip()!r}")
             best = _score(result, "box")
+            if strict_box and best is None:
+                print("    zoom strict: no usable box in the crop; skipping "
+                      "the point fallback (the caller may widen the crop)")
+                return None
+            if strict_box and best is not None and len(result.boxes) == 1:
+                bx1, by1, bx2, by2 = result.boxes[0]
+                if by1 <= 2 and by2 >= crop.size[1] - 2:
+                    if (bx2 - bx1) < 0.7 * crop.size[0]:
+                        # A THIN box spanning the whole crop height is
+                        # the model's "I found a column, not the item"
+                        # answer: the first result is ONE entry at the
+                        # top of the list, it cannot be a vertical
+                        # strip (measured: T3 — a full-height left-edge
+                        # strip was trusted, its center hit the AI
+                        # widget's corner, and the click never
+                        # navigated). The full-width full-frame box is
+                        # already rejected by _score.
+                        print("    zoom strict: thin full-height box = "
+                              "a column, not the result; skipping (the "
+                              "caller may widen the crop)")
+                        return None
+                    # A full-WIDTH full-height box is the model's "the
+                    # whole region" answer. Its center is NOT the
+                    # result: the extended band is only reached when a
+                    # page element (the AI widget) pushed the first
+                    # result below the narrow band, and the result row
+                    # then sits at 64-87% of this crop while the
+                    # center (50%) lands in the widget-result gap
+                    # (measured: T3 — the center point (437,502) hit
+                    # the gap and never navigated). Take the point at
+                    # 70% of the box height: on the measured layout it
+                    # lands on the title row, and it stays inside the
+                    # box.
+                    fx = (bx1 + bx2) / 2.0
+                    fy = by1 + (by2 - by1) * 0.7
+                    print(f"    zoom strict: full-width region box; the "
+                          f"center ({best[1]:.0f},{best[2]:.0f}) would "
+                          f"miss the row — using the 70%-height point "
+                          f"({fx:.0f},{fy:.0f})")
+                    best = (best[0], fx, fy)
             if best is None and self.box_fallback:
                 best = _score(self.worker.point(crop, bare, verbose=False),
                               "point")

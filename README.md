@@ -303,13 +303,23 @@ weaknesses:
   `done` is suggested by the system once all subgoals are marked on
   measured evidence (the 1.7B never calls done on its own).
 - **Decomposer-variance hardening.** The 1.7B decomposer's wording varies
-  run-to-run (it merged "type … and press Enter" into one subgoal, and
-  lifted the goal's terminal clause into a subgoal — run 15). So: a
+  run-to-run (it merged "type … and press Enter" into one subgoal, lifted
+  the goal's terminal clause into a subgoal — run 15 — dropped the
+  quoted-command line entirely — battery T1, wrote meta-prose instead of
+  actions — battery T3, and repeated lines verbatim — battery T3). So: a
   subgoal asking for typing *and* Enter is marked at the Enter step, not
-  the type step; and a "call done when …" subgoal is a termination
-  condition, not an action — it is dropped at decomposition, since no
-  controller step could ever mark it and it would block the all-done
-  signal forever.
+  the type step; a "call done when …" subgoal is a termination condition,
+  not an action — it is dropped at decomposition; a goal that quotes a
+  command to type must have a subgoal carrying it (one re-decompose, then
+  a deterministic append); duplicate lines are dropped; and lines outside
+  the mark surface (no controller step could ever mark them) are dropped,
+  since they would block the all-done signal forever. Marks additionally
+  require the subgoal's *own* quoted command(s) in the typed-text history
+  (a merged "both commands" subgoal is not marked at the first Enter —
+  battery T5), and the fast path types the goal's next still-untyped
+  command after an Enter, so multi-command goals finish deterministically.
+  All of this was measured on the 8-task battery below, not on one ad-hoc
+  goal.
 - **Caps:** 32 steps, 180 s, 3 consecutive failures (blocked repeats
   count).
 
@@ -377,6 +387,93 @@ docker exec cuasandbox bash -lc '
   t=$(xdotool getactivewindow getwindowname)
   [ "$t" = "Mozilla Firefox" ] && echo "desktop clean" || echo "RESET FAILED: $t"'
 ```
+
+ ### Task accuracy: the 8-task battery
+
+ Every task runs through `orchestrate` (LFM3 planner + fast-path over the
+ deterministic controller) — never the scripted path. Each run's driver
+ prints `lfm3_ready=1` as proof the orchestration layer was used, plus
+ per-run evidence: file content + fresh mtime, the final Firefox tab
+ title, and `pgrep -c xfce4-terminal`. All 8 goals share one shape
+ (search → open first result → scroll → terminal → type a verbatim
+ command → Enter) with per-task twists: a no-terminal/no-file goal (T3),
+ a quoted-quotes file (T4), two commands in one goal (T5), a
+ pre-opened terminal (T6), a cold Firefox launch (T7), and preloaded
+ unrelated DDG results (T8). Goals: `eval/goals/t1..t8.txt`; driver:
+ `eval/eval_one.sh` (verify-and-retry reset, per-task setup, evidence
+ summary).
+
+ Final code, one run per task, 2026-11-01, GTX 1070 shared desktop:
+
+ | Task | Setup twist | Steps | Loop | Planner calls | Evidence (file / tab) |
+ |------|-------------|-------|------|---------------|------------------------|
+ | T1 | — | 8 | 23.2 s | 1 | `T1: k8s gpu plugin docs` / GitHub k8s-device-plugin |
+ | T2 | — | 7 | 24.3 s | 1 | `hello world 123` / GeeksforGeeks disk-space |
+ | T3 | no terminal, no file | 4 | 18.8 s | 1 | (none) / CUDA Runtime API docs; 0 terminal procs |
+ | T4 | single+double quotes in file | 7 | 17.1 s | 1 | `T4: single and "double" quotes ok` / Docker Docs GPU access |
+ | T5 | two commands, one 2-line file | 10 | 18.5 s | 1 | exactly `first-line`⏎`second-line` / NVIDIA Enterprise Portal |
+ | T6 | terminal pre-opened | 8 | 26.1 s | 1 | `T6: attach existing terminal` / GitHub k8s-device-plugin |
+ | T7 | Firefox killed (cold launch) | 7 | 22.3 s | 1 | `T7: cold launch ok` / GitHub k8s-device-plugin |
+ | T8 | DDG preloaded with unrelated results | 7 | 20.0 s | 1 | `T8: preloaded results replaced` / GeeksforGeeks disk-space |
+
+ 8/8 pass; every run `exit=0`, `failed_lines=0`, and **1 planner call**
+ (the decompose — the whole loop, including the done, is fast-path).
+ Loop time is dominated by the two grounding passes (search 3.7–6.1 s,
+ click 2.5–7.9 s); everything else is sub-2 s. T3 is 4 steps because the
+ goal has no scroll/terminal half. T5 is 10 steps because the goal has
+ two type+Enter pairs.
+
+ The battery's value is the failure analysis, not the 8/8. Before the
+ hardening above, each task exposed a distinct orchestration-layer bug,
+ root-caused from logs + evidence screenshots, and fixed generally (no
+ case-specific branches):
+
+ - **Stale grounding on a moving page** (T1): the DDG Search Assist
+   widget expanded *during* the click's vision pass, so the click hit
+   the widget. Fix: re-capture after the vision pass and re-ground once
+   if the frame moved > 2% (`_REGROUND_DIFF_PCT`), plus a retry budget
+   that lets a same-state step run exactly one more time (fresh
+   grounding is the remedy) and blocks the second.
+ - **The results-band prior misses the first result when the widget is
+   up** (T1/T2/T3): the deterministic band (0.62h–0.8h) is tuned for
+   the bare results layout; an expanded widget pushes the result below
+   0.8h. Fix: two measured triggers escalate to the band extended to
+   the window bottom — the box pass answering "no target in this crop"
+   (with `strict_box` skipping the trusted-point fallback that would
+   latch onto widget text), and a grounded point in the band's bottom
+   30% (a band-edge caption latch). In the extended band a THIN
+   full-height box is a "column, not the item" answer (rejected), while
+   a FULL-WIDTH one is a "whole region" answer whose 50%-height center
+   lands in the widget–result gap — the click uses the 70%-height point
+   instead (measured: 50% missed the title row, 70% hit it, first
+   click navigated).
+ - **Decomposer dropped the typed-command subgoal** (T1): all_done fired
+   with the command never typed and the file never written. Fix: the
+   coverage check (re-decompose once, then a deterministic append of the
+   goal's own words).
+ - **The open-terminal mark fired on "In the terminal, type …"** (T2):
+   the open mark now excludes type/run/enter phrasing.
+ - **A merged multi-command subgoal marked at the first Enter** (T5):
+   the second command never ran, yet all_done fired. Fix: marks require
+   the subgoal's *own* quoted command(s) in the typed-text history, and
+   the fast path types the goal's next still-untyped command after an
+   Enter.
+ - **Unmarkable decomposer lines block all_done forever** (T3):
+   "Verify that the article is opened" ×2, junk alternatives ("Use a
+   command-line tool like `curl`…"), exact duplicates, and meta-prose
+   ("Formulate query string: …") — the planner then polled the same
+   `observe` until the failure budget. Fix: the verify-article mark
+   branch, duplicate drop, and the mark-surface filter (lines no
+   controller step could mark are dropped at decomposition).
+
+ Re-run the battery from the sandbox (each task ~20–30 s):
+
+ ```bash
+ docker exec cuasandbox bash -lc \
+   'bash /tmp/eval_one.sh T1 /tmp/goal_t1.txt none /root/note.txt "T1: k8s gpu plugin docs"'
+ # …t2–t8 the same way (goal files, setups and expected contents are in
+ # eval/ in the repo; see eval/eval_one.sh usage in its header).
+ ```
 
 ### Task language
 

@@ -228,6 +228,38 @@ class PlannerError(RuntimeError):
     """The planner produced no usable step (transport or format)."""
 
 
+# Keywords that put a subgoal on the mark surface (see _mark_subgoals):
+# a subgoal is markable iff its words can fire at least one mark
+# branch. Lines outside this surface are decomposer artifacts —
+# meta-prose ('Formulate query string: ...'), alternatives the goal
+# never named ('Use a command-line tool like `curl`...'), or
+# verification the system already does — and no controller step can
+# ever mark them, so leaving one in the checklist blocks all_done
+# forever (measured: T3, runs 3 and 4 — 'Formulate query string' and
+# 'Use DuckDuckGo search to find results (maybe via command...)'
+# instead of atomic actions). Word-boundary matching: 'run' must not
+# match 'runtime'.
+_MARKABLE_RE = re.compile(
+    r"\b(search|results?|scroll|terminal|type|echo|enter|press|"
+    r"execute|run)\b")
+
+
+def _subgoal_markable(sub: str) -> bool:
+    """Whether some controller step could mark this subgoal.
+
+    The mark branches are the system's done-surface: a line the
+    system cannot verify is not an action the system can execute, so
+    it is dropped at decompose time instead of blocking completion.
+    """
+    s = sub.lower()
+    if _MARKABLE_RE.search(s):
+        return True
+    # The verify-article mark branch: verify/check/confirm +
+    # article/page.
+    return bool(re.search(r"\b(verify|check|confirm)\b", s)
+                and re.search(r"\b(article|page)\b", s))
+
+
 def _is_done_directive(s: str) -> bool:
     """True if the subgoal is the 'call done' instruction itself, not an
     action. The decomposer sometimes lifts the goal's terminal clause into
@@ -240,6 +272,113 @@ def _is_done_directive(s: str) -> bool:
     t = s.strip().lower()
     return bool(re.search(r"\bcall\s*done\b|\bdone\s*when\b|\bmark\s*done\b", t)
                 or t.startswith("done"))
+
+
+def _typed_command_of(goal_text: str) -> str | None:
+    """The exact command the goal says to type, if it quotes one.
+
+    Typed text is verbatim-sensitive (it lands in a file), so when the
+    goal spells out a command the deterministic layer owns the typing:
+    anchored on the 'type ... command:' phrasing, ending at an em-dash
+    or end of line; fallback: a shell-verb scan. None when the goal does
+    not specify a command (the planner types freely).
+
+    Module-level so the decomposer can run the same coverage check (a
+    goal that quotes a command needs a subgoal that carries it).
+    """
+    m = re.search(r"type\s+(?:exactly\s+)?(?:this\s+)?command"
+                  r"\s*[:\-]?\s*([^\n—]+)", goal_text, re.I)
+    if m:
+        cmd = m.group(1).strip()
+    else:
+        m = re.search(r"\b(echo|printf|cat)\b([^\n—]+)", goal_text)
+        if not m:
+            return None
+        cmd = (m.group(1) + m.group(2)).strip()
+    cmd = cmd.rstrip(".").strip("`").strip()
+    words = cmd.split()
+    if len(words) < 2 or not re.match(r"^[a-z0-9_./-]+$", words[0]):
+        return None
+    return cmd
+
+
+def _subgoal_commands(sub: str) -> list[str]:
+    """Every command a subgoal quotes, if it asks to type/run one.
+
+    The decomposer may merge several commands into one subgoal
+    (measured: T5 — both commands of the goal in a single line), so the
+    mark logic checks them all. It also keeps the command verbatim but
+    varies the framing (measured: T5 — 'type exactly this command: …'
+    in one run, 'type exactly: …' with the word 'command' dropped in
+    the next), so the primary 'type … command:' clause is backed by a
+    backtick-span pass: a quoted span of two or more words with a
+    shell-ish first word IS the command. Search phrases in backticks
+    never reach here: the callers only invoke this from the type/enter
+    mark branches, which require a type/run/enter word in the subgoal
+    AND the terminal up.
+    """
+    cmds = []
+    for m in re.finditer(r"type\s+(?:exactly\s+)?(?:this\s+)?command"
+                         r"\s*[:\-]?\s*([^\n—]+)", sub, re.I):
+        cmd = m.group(1).strip().rstrip(".").strip("`").strip()
+        if len(cmd.split()) >= 2:
+            cmds.append(cmd)
+    if not cmds:
+        for m in re.finditer(r"`([^`\n]+)`", sub):
+            cmd = m.group(1).strip().rstrip(".").strip()
+            words = cmd.split()
+            if len(words) >= 2 and re.match(r"^[a-z0-9_./-]+$",
+                                            words[0]):
+                cmds.append(cmd)
+    return cmds
+
+
+def _subgoal_typed(sub: str, typed: list[str]) -> bool:
+    """Whether every command this subgoal quotes was actually typed.
+
+    A 'type … — press Enter' subgoal is marked at the type/enter step
+    only if ITS command(s) are in the typed-text history: with
+    multi-command goals the first Enter must not mark the second
+    command's subgoal (measured: T5 — 'echo second-line' was never
+    typed, but the merged subgoal's 'press Enter' clause was marked by
+    the first Enter and all_done fired with one command unrun). A
+    subgoal that quotes no command passes: there the type/enter step
+    in the terminal IS the evidence.
+    """
+    cmds = _subgoal_commands(sub)
+    if not cmds:
+        return True
+    out = [t.lower() for t in typed]
+    for c in cmds:
+        c = c.lower()
+        if not any(c in t
+                   or all(w in t for w in c.split() if len(w) >= 3)
+                   for t in out):
+            return False
+    return True
+
+
+def _block_commands(text: str) -> list[str]:
+    """Every command quoted in `text`, in order.
+
+    Primary: the 'type … command:' phrasing (finditer — a checklist can
+    carry several). Fallback (measured: T5 — the decomposer keeps the
+    command verbatim but drops the word 'command'): a shell-verb scan
+    (echo/printf/cat), the same one _typed_command_of falls back on.
+    """
+    cmds = []
+    for m in re.finditer(r"type\s+(?:exactly\s+)?(?:this\s+)?command"
+                         r"\s*[:\-]?\s*([^\n—]+)", text, re.I):
+        cmd = m.group(1).strip().rstrip(".").strip("`").strip()
+        if len(cmd.split()) >= 2:
+            cmds.append(cmd)
+    if not cmds:
+        for m in re.finditer(r"\b(echo|printf|cat)\b([^\n—]+)", text):
+            cmd = ((m.group(1) + m.group(2)).strip().rstrip(".").strip("`")
+                   .strip())
+            if len(cmd.split()) >= 2:
+                cmds.append(cmd)
+    return cmds
 
 
 class Planner:
@@ -456,7 +595,7 @@ class Planner:
         self._proc = None
 
     def decompose(self, goal: str) -> list[str]:
-        """One extra planning call: split the goal into short atomic
+        """One (or two) planning calls: split the goal into short atomic
         subgoals (2-6, numbered).
 
         The 1.7B planner loses track of multi-part goals mid-run
@@ -464,7 +603,65 @@ class Planner:
         re-clicking the result and polling observe instead of scrolling).
         A short numbered checklist in every prompt keeps it on track.
         Falls back to the whole goal as a single subgoal on any failure.
+
+        Coverage check: a goal that quotes a command to type needs a
+        subgoal that carries it. The decomposer sometimes drops exactly
+        that line (measured: T1 — it wrote a meta-comment into the
+        scroll subgoal and omitted the 'type exactly: `echo ...`' line;
+        the run then ended at 'open terminal' and the file was never
+        written, because all_done fired with the command subgoal
+        absent). The decode is stochastic, so one re-decompose is a
+        second draw; if the command is still missing, the subgoal is
+        appended deterministically from the goal's own words.
         """
+        subs = self._decompose_once(goal)
+        if not subs:
+            print("[planner] using the goal as one subgoal", flush=True)
+            return [goal.strip()]
+        # Exact duplicates: the 1.7B sometimes repeats a line verbatim
+        # (measured: T3 — 'Open the first search result link.' and
+        # 'Verify that the article is opened in the browser.' each
+        # appeared twice). Duplicates are pure noise in the checklist,
+        # and a junk phrasing can also misfire the mark logic.
+        seen: set[str] = set()
+        subs = [s for s in subs
+                if not (s.lower() in seen or seen.add(s.lower()))]
+        # Drop lines outside the mark surface (see _subgoal_markable):
+        # they can never be marked, so they would block all_done
+        # forever. When nothing markable survives, the goal's own
+        # words (which carry its actions) are the checklist.
+        subs = [s for s in subs if _subgoal_markable(s)]
+        if not subs:
+            print("[planner] no markable subgoals; using the goal as "
+                  "one subgoal", flush=True)
+            return [goal.strip()]
+        cmd = _typed_command_of(goal)
+        if cmd:
+            def _covers(sub: str) -> bool:
+                t = sub.replace("`", "").lower()
+                c = cmd.lower()
+                if c in t:
+                    return True
+                # Token-level containment: every word of the command
+                # appears in the subgoal (quotes/backticks may differ).
+                return all(w in t for w in c.split() if len(w) >= 3)
+            if not any(_covers(s) for s in subs):
+                print(f"[planner] decompose dropped the typed-command "
+                      f"subgoal ({cmd!r}); re-decomposing once",
+                      flush=True)
+                again = self._decompose_once(goal)
+                if again and any(_covers(s) for s in again):
+                    subs = again
+                else:
+                    subs.append(f"In the terminal, type exactly this "
+                                f"command: {cmd} — then press Enter.")
+                    print("[planner] command subgoal still missing; "
+                          "appended it deterministically", flush=True)
+        return subs[:8]
+
+    def _decompose_once(self, goal: str) -> list[str]:
+        """One decompose call: the raw subgoal list ([] on failure or an
+        unusable reply)."""
         body = {
             "model": "LFM3",
             "messages": [
@@ -472,7 +669,13 @@ class Planner:
                  "Break the goal into 2-6 short atomic subgoals in "
                  "execution order. One numbered line per subgoal, each "
                  "under 15 words. Keep exact quoted phrases and commands "
-                 "verbatim. Output only the numbered list."},
+                 "verbatim. Every action in the goal gets its own line — "
+                 "never drop or merge a step that types or runs a "
+                 "command. Only the goal's own actions — never add "
+                 "alternatives, tools the goal does not name (no curl, "
+                 "no browser extensions), or verification steps (the "
+                 "system verifies completion). No commentary. Output "
+                 "only the numbered list."},
                 {"role": "user", "content": f"Goal: {goal}"},
             ],
             "max_tokens": 300,
@@ -482,30 +685,28 @@ class Planner:
         }
         try:
             data = self._post(body)
-            text = data["choices"][0]["message"].get("content") or ""
-            subs = []
-            for line in text.splitlines():
-                m = re.match(r"^\s*(?:\d+[\.\):]|[-*])\s*(.+)$",
-                             line.strip())
-                if m and m.group(1).strip():
-                    subs.append(m.group(1).strip())
-            # Drop subgoals that are the "call done" instruction itself
-            # rather than an action (measured: run 15's decomposer lifted
-            # the goal's terminal clause into a subgoal — 'Call done when
-            # the file is created with that content.'). The system calls
-            # done when every ACTION subgoal is marked on measured
-            # evidence, so such a line has no controller step that could
-            # mark it and would block the all-done signal forever.
-            subs = [s for s in subs if not _is_done_directive(s)]
-            if subs:
-                return subs[:6]
-            print(f"[planner] decompose gave no usable list "
-                  f"({text[:120]!r}); using the goal as one subgoal",
-                  flush=True)
         except Exception as e:
-            print(f"[planner] decompose failed ({e!r}); using the goal "
-                  f"as one subgoal", flush=True)
-        return [goal.strip()]
+            print(f"[planner] decompose failed ({e!r})", flush=True)
+            return []
+        text = data["choices"][0]["message"].get("content") or ""
+        subs = []
+        for line in text.splitlines():
+            m = re.match(r"^\s*(?:\d+[\.\):]|[-*])\s*(.+)$",
+                         line.strip())
+            if m and m.group(1).strip():
+                subs.append(m.group(1).strip())
+        # Drop subgoals that are the "call done" instruction itself
+        # rather than an action (measured: run 15's decomposer lifted
+        # the goal's terminal clause into a subgoal — 'Call done when
+        # the file is created with that content.'). The system calls
+        # done when every ACTION subgoal is marked on measured
+        # evidence, so such a line has no controller step that could
+        # mark it and would block the all-done signal forever.
+        subs = [s for s in subs if not _is_done_directive(s)]
+        if not subs:
+            print(f"[planner] decompose gave no usable list "
+                  f"({text[:120]!r})", flush=True)
+        return subs
 
     # ------------------------------------------------------------- plan
 
@@ -769,29 +970,22 @@ class OrchestratedAgent:
         return 1
 
     def _typed_command(self, goal_block: str) -> str | None:
-        """The exact command the goal says to type, if it quotes one.
+        """The exact command the goal says to type, if it quotes one
+        (see _typed_command_of)."""
+        return _typed_command_of(goal_block)
 
-        Typed text is verbatim-sensitive (it lands in a file), so when
-        the goal spells out a command the deterministic layer owns the
-        typing: anchored on the 'type ... command:' phrasing, ending at
-        an em-dash or end of line; fallback: a shell-verb scan. None
-        when the goal does not specify a command (the planner types
-        freely).
-        """
-        m = re.search(r"type\s+(?:exactly\s+)?(?:this\s+)?command"
-                      r"\s*[:\-]?\s*([^\n—]+)", goal_block, re.I)
-        if m:
-            cmd = m.group(1).strip()
-        else:
-            m = re.search(r"\b(echo|printf|cat)\b([^\n—]+)", goal_block)
-            if not m:
-                return None
-            cmd = (m.group(1) + m.group(2)).strip()
-        cmd = cmd.rstrip(".").strip("`").strip()
-        words = cmd.split()
-        if len(words) < 2 or not re.match(r"^[a-z0-9_./-]+$", words[0]):
-            return None
-        return cmd
+    def _next_untyped_command(self, goal_block: str,
+                              typed: list[str]) -> str | None:
+        """The first command still quoted in the checklist that is not
+        in the typed-text history (multi-command goals, T5)."""
+        out = [t.lower() for t in typed]
+        for c in _block_commands(goal_block):
+            c_low = c.lower()
+            if not any(c_low in t or all(w in t for w in c_low.split()
+                                         if len(w) >= 3)
+                       for t in out):
+                return c
+        return None
 
     def _goal_block(self, goal: str, subgoals: list[str],
                     marks: list[bool]) -> str:
@@ -817,20 +1011,25 @@ class OrchestratedAgent:
 
     def _mark_subgoals(self, subgoals: list[str], marks: list[bool],
                        name: str, ok: bool, args: dict,
-                       post: str) -> bool:
+                       post: str,
+                       typed: list[str] | None = None) -> bool:
         """Advance the deterministic progress tracker after a step.
 
         Each mark fires only on measured evidence matching the subgoal's
         semantics (a DDG title for a search subgoal, a non-DDG title
         for 'open the result', the terminal title for terminal
         subgoals, a type/key-executed in the terminal for the command
-        subgoals). Conservative on purpose: a missed mark lets the
-        planner redo the subgoal (capped by the repeat guard); a false
-        mark would make it skip one.
+        subgoals). Command subgoals additionally require their quoted
+        command(s) to be in the typed-text history (`typed`): an Enter
+        marks a command subgoal only if THAT command was typed, not
+        just some command (measured: T5). Conservative on purpose: a
+        missed mark lets the planner redo the subgoal (capped by the
+        repeat guard); a false mark would make it skip one.
         """
         changed = False
         if not ok:
             return changed
+        typed = typed or []
         args_str = str(args).lower()
         for idx, sub in enumerate(subgoals):
             if marks[idx]:
@@ -847,14 +1046,26 @@ class OrchestratedAgent:
                 # the command unexecuted when all_done fired).
                 if (("type" in s or "echo" in s)
                         and "enter" not in s and "press" not in s
-                        and name == "type" and terminal_up):
+                        and name == "type" and terminal_up
+                        and _subgoal_typed(sub, typed)):
                     marks[idx] = changed = True
                 elif (("enter" in s or "press" in s
                        or "execute" in s or "run" in s)
                         and name == "key" and "enter" in args_str
-                        and terminal_up):
+                        and terminal_up
+                        and _subgoal_typed(sub, typed)):
                     marks[idx] = changed = True
-                elif name == "open" and terminal_up:
+                elif (name == "open" and terminal_up
+                        and not any(k in s for k in
+                                    ("type", "echo", "enter", "press",
+                                     "run", "execute"))):
+                    # A subgoal that merely asks for a terminal is
+                    # marked when the terminal is up; a subgoal that
+                    # asks to TYPE/RUN something in it must wait for
+                    # the actual type/enter step (measured: T2 — 'In
+                    # the terminal, type exactly this command: …'
+                    # was marked on the open, and all_done fired
+                    # before the file was ever written).
                     marks[idx] = changed = True
             elif "result" in s and "duckduckgo" not in post.lower():
                 marks[idx] = changed = True
@@ -867,18 +1078,33 @@ class OrchestratedAgent:
             elif "scroll" in s and name == "scroll" \
                     and "duckduckgo" not in post.lower():
                 marks[idx] = changed = True
+            # 'Verify that the article is opened' subgoals are
+            # decomposer variance (measured: T3 — the 1.7B added a
+            # verify step the goal never asked for, and nothing can
+            # mark a verify, so all_done never fired and the planner
+            # polled observe until the failure budget). They are
+            # satisfied by the same measured evidence as 'open the
+            # result': the browser shows a non-results, non-terminal
+            # page.
+            elif (("verify" in s or "check" in s or "confirm" in s)
+                    and ("article" in s or "page" in s)
+                    and "duckduckgo" not in post.lower()
+                    and "terminal" not in post.lower()):
+                marks[idx] = changed = True
             # The decomposer drops context from subgoals (measured:
             # 'Type exactly: `echo ...`' with no word 'terminal'), so
             # type/enter subgoals are marked by WHERE the step ran —
             # the measured terminal title — not the subgoal's words.
             elif (("type" in s or "echo" in s)
                     and "enter" not in s and "press" not in s
-                    and name == "type" and terminal_up):
+                    and name == "type" and terminal_up
+                    and _subgoal_typed(sub, typed)):
                 marks[idx] = changed = True
             elif (("enter" in s or "press" in s
                    or "execute" in s or "run" in s)
                     and name == "key" and "enter" in args_str
-                    and terminal_up):
+                    and terminal_up
+                    and _subgoal_typed(sub, typed)):
                 marks[idx] = changed = True
         return changed
 
@@ -915,7 +1141,8 @@ class OrchestratedAgent:
 
     def _suggestion(self, name: str, ok: bool, pre: str, post: str,
                     goal_block: str,
-                    all_done: bool = False) -> tuple[str, tuple[str, dict] | None] | None:
+                    all_done: bool = False,
+                    typed: list[str] | None = None) -> tuple[str, tuple[str, dict] | None] | None:
         """The canonical next step, suggested by the deterministic layer.
 
         Returns (history_line, (tool_name, args) | None). When the
@@ -996,6 +1223,19 @@ class OrchestratedAgent:
             return ("SUGGESTED NEXT: key {\"combo\": \"enter\"} (execute "
                     "the typed command).",
                     ("key", {"combo": "enter"}))
+        if name == "key" and "terminal" in post.lower():
+            # Multi-command goals (measured: T5): after a command has
+            # run, the next command still quoted in the checklist and
+            # not yet typed is the deterministic next step — no planner
+            # round trip needed for what the goal already spells out
+            # verbatim.
+            nxt = self._next_untyped_command(goal_block, typed or [])
+            if nxt:
+                return ("SUGGESTED NEXT: type "
+                        + json.dumps({"text": nxt})
+                        + " verbatim into the terminal (the goal gives "
+                          "the exact next command), then key enter.",
+                        ("type", {"text": nxt}))
         return ("SUGGESTED NEXT: continue with the next unfinished "
                 "subgoal.", None)
 
@@ -1056,6 +1296,16 @@ class OrchestratedAgent:
         # the canonical chain (a stale drop), recovery after a failed
         # step — and it sees every executed result in the history.
         pending: tuple[str, dict] | None = None
+        # Repeat-guard retry budget (see the guard below): how many times
+        # each (step, args) has actually executed. A step seen in the same
+        # state twice may run one more time (fresh grounding is the
+        # remedy for a stale target); from the second retry on it is
+        # blocked.
+        attempts: dict = {}
+        # Verbatim text of every executed type step: the mark logic
+        # requires a command subgoal's own command(s) in this history
+        # before marking (multi-command goals — see _subgoal_typed).
+        typed: list[str] = []
         # Deterministic subgoal progress (see _mark_subgoals); rebuilt
         # into the goal block before every planning call.
         marks = [False] * len(subgoals)
@@ -1095,19 +1345,28 @@ class OrchestratedAgent:
             # do anything new — the planner can be stuck repeating a step
             # that "succeeded" (or failed) without changing the world
             # (measured: 26x 'open terminal' in a dry run). A repeated step
-            # is executed only if the state moved since the last attempt.
+            # is executed only if the state moved since the last attempt —
+            # or if it has not yet been retried in this state: the first
+            # retry is the correct remedy for a stale grounding on a
+            # moving page (measured: T1, the DDG widget expanded during
+            # the vision pass, so the click hit the widget and the fresh
+            # re-grounding found the link); from the second retry on the
+            # step is blocked — that is where planner fixation burns the
+            # failure budget.
             key = (name, json.dumps(args, sort_keys=True,
                                     ensure_ascii=False))
-            if key in seen_steps and seen_steps[key] == pre:
+            if key in seen_steps and seen_steps[key] == pre \
+                    and attempts.get(key, 0) >= 2:
                 blocked = True
                 ok, detail = False, (
-                    "repeated: the screen is identical to the last "
-                    "attempt, so repeating cannot help — observe, or "
+                    "repeated: already retried once in this exact state "
+                    "and the screen is still identical — observe, or "
                     "move on to the next unfinished subgoal.")
                 post = pre
                 frame_pct = "0.0 (skipped)"
             else:
                 blocked = False
+                attempts[key] = attempts.get(key, 0) + 1
                 # Pre/post frame diff: the planner's "did anything
                 # visible happen?" signal (0-100%, 320x180 gray diff —
                 # the controller's own settle machinery, see
@@ -1120,6 +1379,11 @@ class OrchestratedAgent:
                 pre_cap = screen.capture(scope=self.agent.scope,
                                          monitor_index=self.agent.monitor).image
                 ok, detail = self._exec(name, args, i)
+                if name == "type" and ok:
+                    # Record the verbatim text so the mark logic can
+                    # confirm THIS subgoal's command was typed (not just
+                    # some command). Failed types typed nothing.
+                    typed.append(str(args.get("text", "")))
                 post_cap = screen.capture(scope=self.agent.scope,
                                           monitor_index=self.agent.monitor).image
                 frame_pct = f"{100.0 * _frame_diff(pre_cap, post_cap) / 255.0:.1f}"
@@ -1152,7 +1416,8 @@ class OrchestratedAgent:
             # nothing; no pending exists at execution time (it was
             # consumed above), so the planner simply re-plans next turn.
             if not blocked:
-                self._mark_subgoals(subgoals, marks, name, ok, args, post)
+                self._mark_subgoals(subgoals, marks, name, ok, args, post,
+                                    typed=typed)
                 # The fresh block (post-step marks) is what the planner
                 # will see next turn, and it is what the done-summary
                 # regex reads [DONE] lines from.
@@ -1160,7 +1425,8 @@ class OrchestratedAgent:
                                        self._goal_block(goal, subgoals,
                                                         marks),
                                        all_done=bool(marks)
-                                       and all(marks))
+                                       and all(marks),
+                                       typed=typed)
                 if sug is None:
                     pending = None
                 elif sug[1] is None:
@@ -1171,13 +1437,17 @@ class OrchestratedAgent:
                     m_key = (machine[0], json.dumps(machine[1],
                                                     sort_keys=True,
                                                     ensure_ascii=False))
-                    if seen_steps.get(m_key) == post:
-                        # The suggested step was already executed in this
-                        # exact state: the repeat guard would block it,
-                        # so it is stale. Anchoring on a step that cannot
-                        # run traps the loop (measured: run 9, three
-                        # blocked wait-loads in a row burned the failure
-                        # budget).
+                    if seen_steps.get(m_key) == post \
+                            and attempts.get(m_key, 0) >= 2:
+                        # The suggested step was already executed twice in
+                        # this exact state: the repeat guard would block
+                        # it, so it is stale. (One execution in this state
+                        # is NOT stale — the guard permits a retry, which
+                        # is the right move when the first attempt
+                        # grounded on a stale frame.) Anchoring on a step
+                        # that cannot run traps the loop (measured: run 9,
+                        # three blocked wait-loads in a row burned the
+                        # failure budget).
                         pending = None
                         history.append(
                             "SUGGESTED NEXT: continue with the next "

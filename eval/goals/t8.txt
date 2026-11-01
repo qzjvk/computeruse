@@ -1,0 +1,1 @@
+Search DuckDuckGo for "linux command to check disk space" and open the first result. Scroll the article down 2 notches. Open a terminal. In the terminal, type exactly this command: echo "T8: preloaded results replaced" > /root/note.txt — then press Enter. Call done when everything is complete.
