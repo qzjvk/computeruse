@@ -333,6 +333,25 @@ def _subgoal_commands(sub: str) -> list[str]:
     return cmds
 
 
+def _frame_sig(img) -> str:
+    """A coarse identity for a screen capture.
+
+    md5 of a 32x18 grayscale grid quantized to 8 levels: it moves on a
+    real repaint (a typed character, a page change) and holds under
+    antialiasing jitter. It is the second half of the loop's state
+    identity, (title, sig): a constant window title (a terminal's
+    'Terminal -') says nothing about whether the screen moved —
+    measured: T9's enter chain stalled because three distinct states
+    (each command typed) all read as the same title, so the repeat
+    guard blocked the fourth canonical enter and the planner restarted
+    the chain from step one.
+    """
+    import hashlib
+
+    g = img.convert("L").resize((32, 18))
+    return hashlib.md5(g.point(lambda v: v // 32).tobytes()).hexdigest()
+
+
 def _subgoal_typed(sub: str, typed: list[str]) -> bool:
     """Whether every command this subgoal quotes was actually typed.
 
@@ -354,6 +373,95 @@ def _subgoal_typed(sub: str, typed: list[str]) -> bool:
         if not any(c in t
                    or all(w in t for w in c.split() if len(w) >= 3)
                    for t in out):
+            return False
+    return True
+
+
+def _goal_commands_typed(goal: str, typed: list[str]) -> bool:
+    """Whether every command the goal explicitly quotes is in the
+    typed-text history.
+
+    all_done must not fire while a quoted command is untyped, even if
+    every checklist subgoal is marked: the decomposer can list fewer
+    command subgoals than the goal quotes, and the marks only track
+    the LISTED ones (measured necessity: the 17-command T9 stress
+    goal — a truncated checklist would end the run early). Only the
+    explicit 'type … command:' phrasing counts: the echo/printf/cat
+    fallback can match prose ('search for the echo command') the goal
+    never asks to type.
+    """
+    if not re.search(r"type\s+(?:exactly\s+)?(?:this\s+)?command",
+                     goal, re.I):
+        return True
+    out = [t.lower() for t in typed]
+    for m in re.finditer(r"type\s+(?:exactly\s+)?(?:this\s+)?command"
+                         r"\s*[:\-]?\s*([^\n—]+)", goal, re.I):
+        cmd = m.group(1).strip().rstrip(".").strip("`").strip().lower()
+        if len(cmd.split()) < 2:
+            continue
+        if not any(cmd in t or all(w in t for w in cmd.split()
+                                   if len(w) >= 3)
+                   for t in out):
+            return False
+    return True
+
+
+def _goal_commands_run(goal: str, history: list[str], typed: list[str]) -> bool:
+    """Whether every command the goal explicitly quotes was typed AND —
+    when the goal asks for Enter — actually executed.
+
+    Extends _goal_commands_typed: all_done must not fire while a quoted
+    command is only TYPED, not run. The decomposer can drop the "press
+    Enter" clause from a command subgoal (measured: T2, the subgoal
+    ended at the em-dash, so the mark logic — which marks a
+    type+enter subgoal only at the Enter step — marked it at the type
+    step, and the run ended with the command sitting on the terminal
+    prompt, file never written). The check is positional on the EXECUTED
+    history (measured ok steps, never planner claims): for each quoted
+    command, in goal order, an ok Enter step between its ok type step
+    and the next command's type step (unbounded for the last).
+    """
+    if not _goal_commands_typed(goal, typed):
+        return False
+    if not re.search(r"\benter\b", goal, re.I):
+        return True
+    events = []  # (step_no, "type"|"enter", normalized text)
+    for line in history:
+        m = re.match(r"^step (\d+): (type|key)\((\{.*?\})\) -> (ok|FAILED)",
+                     line)
+        if not m or m.group(4) != "ok":
+            continue
+        try:
+            a = json.loads(m.group(3))
+        except ValueError:
+            continue
+        if m.group(2) == "type":
+            events.append((int(m.group(1)), "type",
+                           str(a.get("text", "")).lower()))
+        elif str(a.get("combo", "")).lower() == "enter":
+            events.append((int(m.group(1)), "enter", None))
+    cmds = []
+    for m in re.finditer(r"type\s+(?:exactly\s+)?(?:this\s+)?command"
+                         r"\s*[:\-]?\s*([^\n—]+)", goal, re.I):
+        cmd = m.group(1).strip().rstrip(".").strip("`").strip().lower()
+        if len(cmd.split()) >= 2:
+            cmds.append(cmd)
+    type_nos = []
+    last = 0
+    for cmd in cmds:
+        tn = next((no for no, verb, txt in events
+                   if no > last and verb == "type"
+                   and (cmd in txt or all(w in txt for w in cmd.split()
+                                          if len(w) >= 3))), None)
+        if tn is None:
+            return False
+        type_nos.append(tn)
+        last = tn
+    enter_nos = [no for no, verb, _ in events if verb == "enter"]
+    for i, tn in enumerate(type_nos):
+        upper = type_nos[i + 1] if i + 1 < len(type_nos) else None
+        if not any(tn < en < (upper if upper is not None else float("inf"))
+                   for en in enter_nos):
             return False
     return True
 
@@ -657,7 +765,13 @@ class Planner:
                                 f"command: {cmd} — then press Enter.")
                     print("[planner] command subgoal still missing; "
                           "appended it deterministically", flush=True)
-        return subs[:8]
+        # Checklist cap: room for every command the goal quotes (one
+        # subgoal each) plus the non-command actions. A fixed cap
+        # truncates multi-command checklists, and all_done would fire
+        # while quoted commands are still untyped — the marks only
+        # track the LISTED subgoals (measured necessity: the 17-command
+        # T9 stress goal).
+        return subs[:max(8, len(_block_commands(goal)) + 4)]
 
     def _decompose_once(self, goal: str) -> list[str]:
         """One decompose call: the raw subgoal list ([] on failure or an
@@ -678,7 +792,10 @@ class Planner:
                  "only the numbered list."},
                 {"role": "user", "content": f"Goal: {goal}"},
             ],
-            "max_tokens": 300,
+            # Budget sized to the goal's command count: the list must
+            # fit every quoted command (one line each); a fixed 300
+            # tokens cut a 17-command list mid-line (T9).
+            "max_tokens": max(300, 40 + 25 * len(_block_commands(goal))),
             "temperature": 0.1,
             "top_k": self.top_k,
             "chat_template_kwargs": {"enable_thinking": False},
@@ -1265,7 +1382,7 @@ class OrchestratedAgent:
         persist = os.environ.get("LFM3_PERSIST", "0") == "1"
         try:
             return self._run_loop(goal, subgoals, history, t0,
-                                  seen_steps={})
+                                  seen_sig={})
         finally:
             # Release the planner's VRAM share unless the user opted to
             # keep it warm: the worker's model reload needs the headroom
@@ -1277,7 +1394,7 @@ class OrchestratedAgent:
                       "running (~1.25 GiB on the shared card)", flush=True)
 
     def _run_loop(self, goal: str, subgoals: list[str],
-                  history: list[str], t0: float, seen_steps: dict) -> bool:
+                  history: list[str], t0: float, seen_sig: dict) -> bool:
         consec_fail = 0
         # Suggestion fast-path state: the deterministic layer's pending
         # machine suggestion (see _suggestion). When one exists the
@@ -1355,8 +1472,30 @@ class OrchestratedAgent:
             # failure budget.
             key = (name, json.dumps(args, sort_keys=True,
                                     ensure_ascii=False))
-            if key in seen_steps and seen_steps[key] == pre \
-                    and attempts.get(key, 0) >= 2:
+            # State identity is (title, frame signature) — _frame_sig.
+            # A constant title (a terminal's) does not mean a frozen
+            # screen: a typed character moves the frame, so a canonical
+            # re-enter is a NEW state, not a repeat (measured: T9, the
+            # title-only identity blocked the fourth enter and the
+            # planner restarted the whole chain from step one). A
+            # STATIC screen still blocks after the second retry —
+            # same title, same frame — which is the planner fixation
+            # this guard exists for; a live one (blinking cursor) means
+            # the repeat is not a no-op, and the failure budget + step
+            # cap bound it. The signature capture short-circuits: only
+            # a step already seen in this title with a spent retry
+            # budget costs one extra grab.
+            _ss = seen_sig.get(key)
+            _repeat = _ss is not None and _ss[0] == pre \
+                and attempts.get(key, 0) >= 2
+            _pre_sig = None
+            if _repeat:
+                from . import screen
+                _pre_sig = _frame_sig(
+                    screen.capture(scope=self.agent.scope,
+                                   monitor_index=self.agent.monitor)
+                    .image)
+            if _repeat and _ss[1] == _pre_sig:
                 blocked = True
                 ok, detail = False, (
                     "repeated: already retried once in this exact state "
@@ -1388,7 +1527,7 @@ class OrchestratedAgent:
                                           monitor_index=self.agent.monitor).image
                 frame_pct = f"{100.0 * _frame_diff(pre_cap, post_cap) / 255.0:.1f}"
                 post = self._title()
-                seen_steps[key] = post
+                seen_sig[key] = (post, _frame_sig(post_cap))
             dt = time.time() - t
             line = (f"step {i + 1}: {name}({json.dumps(args, ensure_ascii=False)}) "
                     f"-> {'ok' if ok else 'FAILED'} in {dt:.1f}s; "
@@ -1425,7 +1564,9 @@ class OrchestratedAgent:
                                        self._goal_block(goal, subgoals,
                                                         marks),
                                        all_done=bool(marks)
-                                       and all(marks),
+                                       and all(marks)
+                                       and _goal_commands_run(goal, history,
+                                                                typed),
                                        typed=typed)
                 if sug is None:
                     pending = None
@@ -1437,8 +1578,10 @@ class OrchestratedAgent:
                     m_key = (machine[0], json.dumps(machine[1],
                                                     sort_keys=True,
                                                     ensure_ascii=False))
-                    if seen_steps.get(m_key) == post \
-                            and attempts.get(m_key, 0) >= 2:
+                    _ms = seen_sig.get(m_key)
+                    if _ms is not None and _ms[0] == post \
+                            and attempts.get(m_key, 0) >= 2 \
+                            and _ms[1] == _frame_sig(post_cap):
                         # The suggested step was already executed twice in
                         # this exact state: the repeat guard would block
                         # it, so it is stale. (One execution in this state

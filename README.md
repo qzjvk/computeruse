@@ -318,10 +318,11 @@ weaknesses:
   (a merged "both commands" subgoal is not marked at the first Enter —
   battery T5), and the fast path types the goal's next still-untyped
   command after an Enter, so multi-command goals finish deterministically.
-  All of this was measured on the 8-task battery below, not on one ad-hoc
+  All of this was measured on the 9-task battery below, not on one ad-hoc
   goal.
-- **Caps:** 32 steps, 180 s, 3 consecutive failures (blocked repeats
-  count).
+- **Caps:** 32 steps (overridable with `--max-steps` — the T9
+  17-command goal runs with a 48 cap), 180 s, 3 consecutive failures
+  (blocked repeats count).
 
 The server is spawned at orchestrate start and stopped at the end. The
 spawn pins the 1070 **alone** via `CUDA_VISIBLE_DEVICES`: llama.cpp's
@@ -388,42 +389,48 @@ docker exec cuasandbox bash -lc '
   [ "$t" = "Mozilla Firefox" ] && echo "desktop clean" || echo "RESET FAILED: $t"'
 ```
 
- ### Task accuracy: the 8-task battery
+ ### Task accuracy: the 9-task battery
 
  Every task runs through `orchestrate` (LFM3 planner + fast-path over the
  deterministic controller) — never the scripted path. Each run's driver
  prints `lfm3_ready=1` as proof the orchestration layer was used, plus
  per-run evidence: file content + fresh mtime, the final Firefox tab
- title, and `pgrep -c xfce4-terminal`. All 8 goals share one shape
+ title, and `pgrep -c xfce4-terminal`. All 9 goals share one shape
  (search → open first result → scroll → terminal → type a verbatim
  command → Enter) with per-task twists: a no-terminal/no-file goal (T3),
  a quoted-quotes file (T4), two commands in one goal (T5), a
- pre-opened terminal (T6), a cold Firefox launch (T7), and preloaded
- unrelated DDG results (T8). Goals: `eval/goals/t1..t8.txt`; driver:
- `eval/eval_one.sh` (verify-and-retry reset, per-task setup, evidence
- summary).
+ pre-opened terminal (T6), a cold Firefox launch (T7), preloaded
+ unrelated DDG results (T8), and a 17-command long-horizon goal (T9 —
+ 40 steps, run with a raised 48-step cap). Goals: `eval/goals/t1..t9.txt`;
+ driver: `eval/eval_one.sh` (verify-and-retry reset, per-task setup,
+ optional `--max-steps`, evidence summary).
 
  Final code, one run per task, 2026-11-01, GTX 1070 shared desktop:
 
  | Task | Setup twist | Steps | Loop | Planner calls | Evidence (file / tab) |
  |------|-------------|-------|------|---------------|------------------------|
- | T1 | — | 8 | 23.2 s | 1 | `T1: k8s gpu plugin docs` / GitHub k8s-device-plugin |
- | T2 | — | 7 | 24.3 s | 1 | `hello world 123` / GeeksforGeeks disk-space |
- | T3 | no terminal, no file | 4 | 18.8 s | 1 | (none) / CUDA Runtime API docs; 0 terminal procs |
- | T4 | single+double quotes in file | 7 | 17.1 s | 1 | `T4: single and "double" quotes ok` / Docker Docs GPU access |
- | T5 | two commands, one 2-line file | 10 | 18.5 s | 1 | exactly `first-line`⏎`second-line` / NVIDIA Enterprise Portal |
- | T6 | terminal pre-opened | 8 | 26.1 s | 1 | `T6: attach existing terminal` / GitHub k8s-device-plugin |
- | T7 | Firefox killed (cold launch) | 7 | 22.3 s | 1 | `T7: cold launch ok` / GitHub k8s-device-plugin |
- | T8 | DDG preloaded with unrelated results | 7 | 20.0 s | 1 | `T8: preloaded results replaced` / GeeksforGeeks disk-space |
+ | T1 | — | 8 | 27.4 s | 1 | `T1: k8s gpu plugin docs` / GitHub k8s-device-plugin |
+ | T2 | — | 7 | 20.6 s | 1 | `hello world 123` / GeeksforGeeks disk-space |
+ | T3 | no terminal, no file | 4 | 18.2 s | 1 | (none) / CUDA Runtime API docs; 0 terminal procs |
+ | T4 | single+double quotes in file | 8 | 13.7 s | 1 | `T4: single and "double" quotes ok` / Stack Overflow nvidia-runtime |
+ | T5 | two commands, one 2-line file | 10 | 16.4 s | 1 | exactly `first-line`⏎`second-line` / NVIDIA Enterprise Portal |
+ | T6 | terminal pre-opened | 8 | 24.2 s | 1 | `T6: attach existing terminal` / GitHub k8s-device-plugin |
+ | T7 | Firefox killed (cold launch) | 8 | 36.3 s | 1 | `T7: cold launch ok` / GitHub k8s-device-plugin |
+ | T8 | DDG preloaded with unrelated results | 7 | 19.3 s | 1 | `T8: preloaded results replaced` / GeeksforGeeks disk-space |
+ | T9 | 17 commands, one 17-line file; 48-step cap | 40 | 29.9 s | 1 | `/root/pool.conf` all 17 lines exact / GitHub k8s-device-plugin |
 
- 8/8 pass; every run `exit=0`, `failed_lines=0`, and **1 planner call**
+ 9/9 pass; every run `exit=0`, `failed_lines=0`, and **1 planner call**
  (the decompose — the whole loop, including the done, is fast-path).
  Loop time is dominated by the two grounding passes (search 3.7–6.1 s,
  click 2.5–7.9 s); everything else is sub-2 s. T3 is 4 steps because the
  goal has no scroll/terminal half. T5 is 10 steps because the goal has
- two type+Enter pairs.
+ two type+Enter pairs. T9 is 40 steps: the 3-step preamble (search,
+ click, scroll), 17 type+Enter pairs, and the done — the decompose's
+ checklist cap and output budget are sized to the goal's command count
+ (a fixed 8-line checklist / 300-token budget would have truncated the
+ 17-command goal and fired all_done before every command was typed).
 
- The battery's value is the failure analysis, not the 8/8. Before the
+ The battery's value is the failure analysis, not the 9/9. Before the
  hardening above, each task exposed a distinct orchestration-layer bug,
  root-caused from logs + evidence screenshots, and fixed generally (no
  case-specific branches):
@@ -465,13 +472,40 @@ docker exec cuasandbox bash -lc '
    `observe` until the failure budget. Fix: the verify-article mark
    branch, duplicate drop, and the mark-surface filter (lines no
    controller step could mark are dropped at decomposition).
+ - **The repeat guard read state as the window title alone** (T9):
+   the terminal title is constant (`Terminal -`) across every type and
+   Enter, so after the second Enter the third canonical Enter was
+   judged "already executed twice in this exact state", the fast path
+   dropped the pending suggestion, and the planner restarted the chain
+   from the search — re-typing commands with no Enters — until the
+   failure budget. Fix: state identity is now (title, frame
+   signature) — the md5 of a 32×18 grayscale capture quantized to
+   8 levels (`_frame_sig`) — used by both the repeat guard and the
+   fast-path stale check, so they stay in sync. A typed character moves
+   the frame, so each Enter is a new state; a truly STATIC screen still
+   blocks after the second retry (same title, same frame), which is
+   the planner fixation the guard exists for. The signature capture
+   short-circuits: only a repeated step in the same title with a spent
+   retry budget costs one extra grab.
+ - **The decomposer dropped the "press Enter" clause from a command
+   subgoal** (T2, second run): the subgoal ended at the em-dash, so the
+   mark logic — which marks a type+enter subgoal only at the Enter step
+   when the subgoal itself says Enter — marked it at the type step, and
+   all_done fired with the command sitting on the terminal prompt, file
+   never written (the typed-only guard passed, because the command WAS
+   typed). Fix: all_done now also requires `_goal_commands_run` — every
+   command the goal explicitly quotes must be in the typed history AND,
+   when the goal asks for Enter, an ok Enter step in the EXECUTED
+   history between each command's ok type step and the next command's
+   type step (unbounded for the last). Measured steps only — never the
+   planner's claims.
 
  Re-run the battery from the sandbox (each task ~20–30 s):
 
  ```bash
  docker exec cuasandbox bash -lc \
    'bash /tmp/eval_one.sh T1 /tmp/goal_t1.txt none /root/note.txt "T1: k8s gpu plugin docs"'
- # …t2–t8 the same way (goal files, setups and expected contents are in
+ # …t2–t9 the same way (goal files, setups and expected contents are in
  # eval/ in the repo; see eval/eval_one.sh usage in its header).
  ```
 

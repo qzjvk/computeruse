@@ -1,12 +1,14 @@
 #!/bin/bash
-# usage: eval_one.sh <id> <goalfile> <setup:none|terminal|killfirefox|preddg> <checkfile> <expected>
+# usage: eval_one.sh <id> <goalfile> <setup:none|terminal|killfirefox|preddg> <checkfile> <expected> [maxsteps]
 # Runs ONE goal through the orchestration layer (LFM3 planner +
 # deterministic controller) and prints a compact evidence summary.
+# maxsteps: optional — pass --max-steps to the orchestrator (default 32).
 export DISPLAY=:99
-ID=$1; GOAL=$2; SETUP=$3; CHECKFILE=$4; EXPECTED=$5
+ID=$1; GOAL=$2; SETUP=$3; CHECKFILE=$4; EXPECTED=$5; MAXSTEPS=$6
 
 # --- verified reset (close terminal with retry, about:blank, fresh files) ---
 rm -f /root/note.txt /root/note2.txt /root/multi.txt
+[ -n "$CHECKFILE" ] && rm -f "$CHECKFILE"
 ok_reset=0
 for i in 1 2 3; do
   xdotool search --name "Terminal" windowclose 2>/dev/null; sleep 0.5
@@ -40,8 +42,10 @@ case "$SETUP" in
 esac
 
 # --- the run: orchestrate kind -> OrchestratedAgent + LFM3 Planner ---
+STEPS_ARG=()
+[ -n "$MAXSTEPS" ] && STEPS_ARG=(--max-steps "$MAXSTEPS")
 CUA_WAIT_SERVER=60 timeout 300 python -m computer_use \
-  --save-dir /tmp/eval_runs --task-file "$GOAL" orchestrate \
+  --save-dir /tmp/eval_runs --task-file "$GOAL" "${STEPS_ARG[@]}" orchestrate \
   > "/tmp/eval_${ID}.log" 2>&1
 RC=$?
 
