@@ -39,10 +39,12 @@ REPO = Path(__file__).resolve().parent
 VENV_PY = REPO / ".venv" / "bin" / "python"
 RUNS = REPO / "cua_runs"
 LFM3_NAME = "LFM3-1.7B-Q4_K_M.gguf"
-# Free VRAM the 1070 must have before a host run: the NF4 LocateAnything
-# worker (~3.3 GB) plus the planner's own spawn check (>= 2.5 GB free,
-# orchestrator.ensure_server). Both load on the same shared card.
-MIN_FREE_MIB = 6144
+# Free VRAM the 1070 must have before a host run: the worker's fp16
+# load peak (~6.4 GB measured at the NF4 quantize pass) plus the live
+# desktop — the old 6 GiB threshold let a run start that OOM'd inside
+# the load (measured 2026-11-02). The planner's own spawn check
+# (>= 2.5 GB free) waits/retries after the worker loads.
+MIN_FREE_MIB = 7168
 
 USAGE = __doc__
 
@@ -317,6 +319,32 @@ def _run_id() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
+def _reap_stale_planners() -> None:
+    """Kill LFM3 planner servers left behind by earlier runs.
+
+    A planner server can survive the run that spawned it: the stop
+    races with a crash mid-decode (measured 2026-11-02 — the crashed
+    run's server was still up eleven minutes later, holding 1.3 GB on
+    the 1070, and OOM'd the next two host runs inside the worker load
+    that had been green before). Only reap servers running the LFM3
+    model: those are ours, nothing else on the host uses it.
+    """
+    try:
+        out = subprocess.run(
+            ["pgrep", "-af", "llama-serve[r]"],
+            capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return
+    for line in out.splitlines():
+        if "LFM3" not in line:
+            continue
+        pid = line.split()[0]
+        print(f"cua: killing stale planner server from a previous run "
+              f"(pid {pid})", flush=True)
+        subprocess.run(["kill", pid], capture_output=True)
+    time.sleep(1.5)
+
+
 def _check_host(dry_run: bool, force: bool) -> None:
     if not VENV_PY.exists():
         die(f"{VENV_PY} not found — set up the venv first "
@@ -389,6 +417,7 @@ def _tee(proc, log_path: Path) -> int:
 
 
 def _run_host(goal: str, run_id: str, opts: dict) -> int:
+    _reap_stale_planners()
     _check_host(opts["dry_run"], opts["force"])
     bin_path = _lfm3_bin()
     model = _lfm3_model()
