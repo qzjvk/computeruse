@@ -351,6 +351,26 @@ def _subgoal_garbage_reason(sub: str) -> str | None:
     return None
 
 
+def _invented_quote_reason(sub: str, goal: str) -> str | None:
+    """Why a decompose line quotes something the goal never quoted.
+
+    The decompose contract is that quoted phrases and commands stay
+    VERBATIM from the goal, so a quoted span not in the goal's text is
+    the 1.7B inventing an action (measured: 'open a terminal' drew
+    'Type `Ctrl+Alt+F4` to exit current session' and 'Run command
+    `gnome-terminal` or `xterm`' — neither span is in the goal; the
+    invented lines blocked all_done and the run burned its step cap).
+    The command-coverage check below re-adds a genuinely goal-quoted
+    command if a line carrying it is dropped, so the drop is safe.
+    """
+    g = goal.casefold()
+    for m in re.finditer(r"`([^`\n]+)`|\"([^\"\n]+)\"", sub):
+        span = (m.group(1) or m.group(2) or "").strip()
+        if span and span.casefold() not in g:
+            return f"quoted span {span!r} not in the goal"
+    return None
+
+
 def _is_done_directive(s: str) -> bool:
     """True if the subgoal is the 'call done' instruction itself, not an
     action. The decomposer sometimes lifts the goal's terminal clause into
@@ -1034,7 +1054,12 @@ class Planner:
 
     def decompose(self, goal: str) -> list[str]:
         """One (or two) planning calls: split the goal into short atomic
-        subgoals (2-6, numbered).
+        subgoals (1-6, numbered). A goal with one action gets one
+        subgoal — the '2-6' floor made the 1.7B invent actions the
+        goal never names (measured: 'open a terminal' drew 'Type
+        Ctrl+Alt+F4 to exit current session' and 'Run gnome-terminal'
+        — none of it in the goal; the invented lines blocked all_done
+        and the run burned its step cap re-doing marked work).
 
         The 1.7B planner loses track of multi-part goals mid-run
         (measured: after the article opened — subgoal 2 of 6 — it kept
@@ -1072,7 +1097,8 @@ class Planner:
         # and burned the step budget re-doing completed chains).
         kept = []
         for s in subs:
-            why = _subgoal_garbage_reason(s)
+            why = _subgoal_garbage_reason(s) or _invented_quote_reason(
+                s, goal)
             if why:
                 print(f"[planner] dropping garbage subgoal "
                       f"({why}): {s[:70]!r}", flush=True)
@@ -1129,7 +1155,7 @@ class Planner:
             "model": "LFM3",
             "messages": [
                 {"role": "system", "content":
-                 "Break the goal into 2-6 short atomic subgoals in "
+                 "Break the goal into 1-6 short atomic subgoals in "
                  "execution order. One numbered line per subgoal, each "
                  "under 15 words. Keep exact quoted phrases and commands "
                  "verbatim. Every action in the goal gets its own line — "

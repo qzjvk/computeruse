@@ -287,7 +287,9 @@ The planner is 1.7B, so the architecture compensates for measured
 weaknesses:
 
 - **Goal decomposition + an external progress tracker.** The goal is
-  split once into 2–6 subgoals; every planning prompt re-lists them with
+  split once into 1–6 subgoals (one action, one subgoal — a '2-6'
+  floor made the 1.7B invent actions for single-clause goals); every
+  planning prompt re-lists them with
   `[DONE]`/`[NEXT]`/`[ ]` marks that advance only on *measured* state
   (DDG title, non-DDG title, terminal title, type/key run in the
   terminal). The model loses multi-part goals mid-run, so progress is
@@ -329,6 +331,16 @@ weaknesses:
   (a merged "both commands" subgoal is not marked at the first Enter —
   battery T5), and the fast path types the goal's next still-untyped
   command after an Enter, so multi-command goals finish deterministically.
+  A subgoal line that quotes a span (backticks or double quotes) that
+  does not appear verbatim in the goal is fabrication and is dropped
+  (`_invented_quote_reason` — the decompose contract keeps quoted
+  phrases verbatim, so a span not in the goal's text is an invented
+  action; measured: the single-clause goal 'open a terminal' drew
+  'Type `Ctrl+Alt+F4` to exit current session' and 'Run command
+  `gnome-terminal`' — neither span in the goal; the invented lines
+  blocked all_done and the run burned its step cap re-doing marked
+  work; the drop is safe because the command-coverage check re-adds a
+  genuinely goal-quoted command if a carrier line is dropped).
   All of this was measured on the 9-task battery below, not on one ad-hoc
   goal.
 - **Caps:** 32 steps (overridable with `--max-steps` — the T9
@@ -723,6 +735,61 @@ if found and found[0].grab_focus():
  # eval/ in the repo; see eval/eval_one.sh usage in its header).
  ```
 
+### One command: `cua` — take over, get a report back
+
+`cua` (repo root, `cua.py` — stdlib only; the agent itself runs through
+`.venv`) wraps `orchestrate` as a one-shot takeover:
+
+```bash
+cua "goal to accomplish"       # HOST: takes over your live desktop
+cua --sandbox "goal"           # runs in cuasandbox (your desktop untouched)
+cua show [run-id]              # re-print a saved report (latest by default)
+cua list                       # past runs: id, status, goal
+```
+
+Per-run options: `--dry-run` (never touches the screen), `--yes` (skip
+the ack), `--force` (bypass the VRAM guard), `--max-steps N`,
+`--max-seconds S`, `--planner-ctx N` — passed through to the
+orchestrate client.
+
+Every run writes `cua_runs/<run-id>/` (git-ignored): `report.md` /
+`report.json` — the result: status, the step table, and the done
+summary (the answer, if any); the report parses the orchestrator's own
+transcript, so the "result" is exactly what the run's done line said —
+plus `run.log` (full transcript, live-tee'd to the terminal) and
+`stepNN-*.png` (per-step screenshots — the evidence). Exit codes: 0
+done/dry-run, 1 incomplete (budget / failures / step cap / interrupted),
+2 usage or setup.
+
+Host-mode safety (it is YOUR desktop):
+
+- **VRAM guard**: the 1070 needs ≥ 6 GiB free before a host run (the NF4
+  worker ~3.3 GB plus the planner's own spawn check ≥ 2.5 GB — both on
+  the same shared card). It refuses with a `--sandbox` hint when the
+  cuasandbox worker is resident; `--force` overrides.
+- **Explicit ack**: on a TTY it asks before the first move (Enter to
+  start, Ctrl-C to cancel; `--yes` skips, `--dry-run` never touches).
+- **Abort at any time**: Ctrl-C, or slam the mouse into the top-left
+  corner of the screen (pyautogui failsafe — the agent dies, the report
+  is still written from the partial transcript).
+- Host mode **never resets** the desktop (it must not close your
+  windows). A `--sandbox` run executes the verified reset before the
+  run — close terminal with retry, Firefox → about:blank (the location
+  bar is FOCUSED from the a11y tree, `grab_focus`, not clicked; its node
+  name varies per search engine; verify + retry — ported from
+  `eval/eval_one.sh`): a run expects a clean desktop, because a
+  leftover unsubmitted line in the terminal prompt appends to the
+  goal's first command and corrupts it (measured: T9 via cua came out
+  16/17 lines until the reset was ported).
+
+First host run auto-provisions the planner: `LFM3_BIN` (`$LFM3_BIN` →
+`which llama-server` → the sibling `llama.cpp/build/bin`), and the
+1.05 GB GGUF is copied out of the cuasandbox container to
+`~/models/LFM3-1.7B-Q4_K_M.gguf` instead of downloaded. If a resident
+host worker sits on the socket, `cua` uses it (the transcript prints
+when the run completes); otherwise it runs in-process with a fresh NF4
+load (~25 s, live transcript).
+
 ### Task language
 
 Steps are separated by `;` or newlines. A bare phrase is treated as `click`.
@@ -909,6 +976,7 @@ computer_use/
 Dockerfile          # XFCE sandbox image (Xvfb + noVNC + agent)
 entrypoint.sh       # sandbox entrypoint: desktop + VNC + serve (+ a11y bus)
 eval/               # 9-task battery: eval_one.sh driver + goals/t1..t10.txt
+cua.py              # one-command takeover: host/sandbox run + per-run report
 sandbox.sh          # host wrapper: up/down/task/dry/status
 locatenv/           # model weights (git-ignored)
 ```
