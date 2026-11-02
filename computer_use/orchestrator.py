@@ -594,6 +594,31 @@ def _wants_a_specific_result(goal_block: str) -> bool:
         goal_block, re.I))
 
 
+def _wants_many_sources(goal_block: str) -> bool:
+    """Does the goal ask for SEVERAL sources read one by one
+    (research) — vs. a goal whose action targets the ONE opened page
+    ('open discord and interact')?
+
+    Only research goals take the source-page recipe 'read, then
+    browser Back to the results page'. The recipe misfires on in-page
+    goals: the page IS the target, and Back loops (measured
+    2026-11-02: 'open up discord and interact with the users' — the
+    fast path burned six steps on ctrl+Left on the Discord page, then
+    the planner observed until the failure budget). Signals, all
+    goal-derived: a counted source ('at least 3 sources'), a source
+    noun with an examining verb (compare / one by one / each), or an
+    explicit return-to-results instruction.
+    """
+    low = goal_block.lower()
+    if re.search(r"\b(at least|at most|every|each)\b[^.\n]{0,30}\bsources?\b",
+                 low):
+        return True
+    if re.search(r"\b(sources?|results?|pages?)\b", low) and re.search(
+            r"\b(compare|comparison|one by one|each|side by side)\b", low):
+        return True
+    return "return to the results" in low or "back to the results" in low
+
+
 # "open at least 3 Portuguese sources": the count the subgoal itself
 # names (goal-derived; the fast path already works this way — scroll
 # counts, quoted commands). N is a digit or a word number (the
@@ -1732,6 +1757,21 @@ class OrchestratedAgent:
         if not _wants_a_specific_result(goal_block) and _is_source_page(post):
             visited = _page_titles(seen_before)
             if post in (seen_before or set()):
+                if not _wants_many_sources(goal_block):
+                    # In-page goal: the opened page IS the target
+                    # ('open discord and interact'), not one of several
+                    # sources — the read->Back recipe loops here
+                    # (measured 2026-11-02: 'open up discord and
+                    # interact with the users' — six steps of ctrl+Left
+                    # on the Discord page, then the planner observed
+                    # until the failure budget). Hand the wheel to the
+                    # planner ON the page: the hint lands in the
+                    # history, and read (the page's content) stays
+                    # available to it.
+                    return ("SUGGESTED NEXT: none — the goal's action "
+                            "targets the CURRENT page; click/type on "
+                            "the page itself (read dumps its content). "
+                            "Do not go back to a results page.", None)
                 unopened = _unopened_from_dump(last_dump, visited)
                 _extra = (" Unopened results in the last read dump: "
                           + "; ".join(f"'{u[:60]}'" for u in unopened)
@@ -2366,7 +2406,11 @@ class OrchestratedAgent:
                 if sug is None:
                     pending = None
                 elif sug[1] is None:
-                    history.append(sug[0])
+                    # Planner-facing hint: into the history, not forced.
+                    # Skip an immediate duplicate — the branch re-fires
+                    # on every step while the state holds.
+                    if not history or history[-1] != sug[0]:
+                        history.append(sug[0])
                     pending = None
                 else:
                     sug_line, machine = sug
