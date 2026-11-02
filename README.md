@@ -192,9 +192,10 @@ python -m computer_use --image screenshot.png --query "the gear"
 ```
 
 Model-level options (`--model/--gpu/--dtype/--attn/--in-token-limit/--scope/
---vit-cpu/--quant`) are fixed by the `serve` invocation; per-run options (`--dry-run`,
-`--delay`, `--max-steps`, `--monitor`, `--save-dir`, `--no-box-fallback`) are
-sent with each task. `--no-server` forces a local load. Measured on the 1070:
+--vit-cpu/--quant`) are fixed by the `serve` invocation; per-run options
+(`--dry-run`, `--delay`, `--max-steps`, `--monitor`, `--save-dir`,
+`--no-box-fallback`, and for `orchestrate` runs `--task-file`,
+`--max-seconds`, `--planner-ctx`) are sent with each task. `--no-server` forces a local load. Measured on the 1070:
 ~90 s per run without the worker vs ~35–45 s with it (2 tiled passes at
 4096 tokens remain the bottleneck — that is Pascal prefill, not startup).
 
@@ -316,9 +317,14 @@ weaknesses:
   the type step; a "call done when …" subgoal is a termination condition,
   not an action — it is dropped at decomposition; a goal that quotes a
   command to type must have a subgoal carrying it (one re-decompose, then
-  a deterministic append); duplicate lines are dropped; and lines outside
-  the mark surface (no controller step could ever mark them) are dropped,
-  since they would block the all-done signal forever. Marks additionally
+  a deterministic append); duplicate lines are dropped; meta-prose
+  (self-referential commentary like "i.e." / "we need to" / "the goal
+  says") and lines truncated mid-token by the decode's token budget
+  (unbalanced parens/quotes) are dropped as garbage
+  (`_subgoal_garbage_reason` — a parked meta line in the counted-source
+  branch burned the battery re-run's step budget, T2/T4/T6); and lines
+  outside the mark surface (no controller step could ever mark them) are
+  dropped, since they would block the all-done signal forever. Marks additionally
   require the subgoal's *own* quoted command(s) in the typed-text history
   (a merged "both commands" subgoal is not marked at the first Enter —
   battery T5), and the fast path types the goal's next still-untyped
@@ -453,8 +459,8 @@ least 3 Portuguese sources from it. Open the sources one by one
 (… read the page; return …). Compare the prices you see. Call
 done with a summary that reports the cheapest RTX 3060 you found,
 its price, and every source you checked with the price you saw
-there." Run with `--max-steps 64 --max-seconds 900 --planner-ctx
-8192`. Final code, 2026-11-01, GTX 1070 shared desktop (re-run
+there." (goal: `eval/goals/t10.txt`) Run with `--max-steps 64
+--max-seconds 900 --planner-ctx 8192`. Final code, 2026-11-01, GTX 1070 shared desktop (re-run
 after the counted-source gate fix below — same shape, same step
 count): **21 steps / 140.7 s, EXIT=0, 3 distinct Portuguese
 sources opened AND read** (KuantoKusta, OLX anúncios, OLX
@@ -890,23 +896,29 @@ auto-selects bf16, keeps the vision encoder on the GPU, and you can opt into
 
 ```
 computer_use/
+├── __init__.py     # X handles opened before torch import (segfault otherwise)
 ├── worker.py       # model loading + inference (1070-tuned), GroundingResult
 ├── grounding.py    # parse <box><x>…</box> output into pixel coords
 ├── screen.py       # mss screenshot capture + monitor coordinate mapping
 ├── actions.py      # pyautogui click/type/key/scroll + detached launch (dry-run aware)
 ├── controller.py   # task language + perceive→ground→act loop
+├── orchestrator.py # LFM3 planner + suggestion fast-path + measured state machine
+├── atspi.py        # AT-SPI a11y-tree dump (the `read` content channel)
 ├── server.py       # resident worker: model stays in VRAM, tasks over a Unix socket
-└── __main__.py     # CLI (agent / offline / serve)
+└── __main__.py     # CLI (agent / offline / serve / orchestrate)
 Dockerfile          # XFCE sandbox image (Xvfb + noVNC + agent)
-entrypoint.sh       # sandbox entrypoint: desktop + VNC + serve
+entrypoint.sh       # sandbox entrypoint: desktop + VNC + serve (+ a11y bus)
+eval/               # 9-task battery: eval_one.sh driver + goals/t1..t10.txt
 sandbox.sh          # host wrapper: up/down/task/dry/status
 locatenv/           # model weights (git-ignored)
 ```
 
 ## Limitations
 
-- One step = one grounded phrase; there is no LLM planner. Express multi-step
-  flows in the task language above (or add a planner that emits it).
+- The scripted path has no planner: one step = one grounded phrase. Express
+  multi-step flows in the task language above; open-ended goals (research,
+  comparison) go through `orchestrate` instead, where the 1.7B LLM plans
+  over the same controller.
 - Window scope follows the *focused* window — keep the target app in the
   foreground; if the focus moves between steps, steps operate on the new
   window.
