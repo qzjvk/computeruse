@@ -29,6 +29,10 @@ services:
       - "5900:5900"   # raw VNC (native clients: crisp 1:1, no web lag)
     volumes:
       - ./locatenv:/locatenv:ro
+      # LFM3 planner weights: host-side copy so a `docker compose down`
+      # (container removal) never loses them — they were in the
+      # container layer once and died with it (measured 2026-11-02).
+      - ~/models:/root/models:ro
       # Live code mount: edits on the host take effect after
       # `./sandbox.sh restart` (worker reload, ~40 s) - no image rebuild.
       - ./computer_use:/app/computer_use

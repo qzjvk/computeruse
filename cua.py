@@ -81,12 +81,17 @@ def _lfm3_bin() -> Path | None:
     return sibling if sibling.exists() else None
 
 
-def _lfm3_model() -> Path | None:
+def _lfm3_model_path() -> Path:
+    """Where the planner's GGUF lives on the host: $LFM3_MODEL,
+    else ~/models/<name>."""
     env = os.environ.get("LFM3_MODEL")
-    if env and os.path.exists(env):
-        return Path(env)
-    home = Path.home() / "models" / LFM3_NAME
-    return home if home.exists() else None
+    return Path(env) if env else Path.home() / "models" / LFM3_NAME
+
+
+def _lfm3_model() -> Path | None:
+    """The GGUF path, or None when it does not exist yet."""
+    p = _lfm3_model_path()
+    return p if p.exists() else None
 
 
 def _sandbox_up() -> bool:
@@ -112,7 +117,7 @@ def _provision_host_lfm3(bin_path: Path | None, model: Path) -> None:
     if not _sandbox_up():
         die(f"planner model missing: {model} — start the cuasandbox "
             f"container (cua can copy the GGUF out of it) or download it: "
-            f"huggingface-cli download LiquidAI/LFM3-1.7B "
+            f"huggingface-cli download LiquidAI/LFM3-1.7B-GGUF "
             f"--local-dir {Path.home() / 'models'} "
             f"--include {LFM3_NAME}")
     print(f"cua: first run — copying the LFM3 planner weights out of the "
@@ -390,8 +395,8 @@ def _run_host(goal: str, run_id: str, opts: dict) -> int:
     if model is None:
         # First run: copies the GGUF out of the sandbox; dies with a
         # clear message when the binary is missing or the sandbox is
-        # down.
-        _provision_host_lfm3(bin_path, model)
+        # down (with the download command to run instead).
+        _provision_host_lfm3(bin_path, _lfm3_model_path())
         model = _lfm3_model()
 
     use_socket = os.path.exists(
